@@ -6,6 +6,7 @@ import java.sql.PreparedStatement;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -22,7 +23,7 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class RosterImportRepository {
 
-    static final int BATCH_SIZE = 500;
+    static final int BATCH_SIZE = 1000;
 
     private static final RowMapper<ImportRecord> IMPORT_MAPPER = (rs, i) -> new ImportRecord(
             rs.getString("tenant_id"),
@@ -124,6 +125,11 @@ public class RosterImportRepository {
      */
     public void stageBatch(String tenantId, UUID importId, List<CsvRow> rows) {
         if (rows.isEmpty()) return;
+        java.util.Map<String, CsvRow> uniqueRows = new java.util.LinkedHashMap<>();
+        for (CsvRow r : rows) {
+            uniqueRows.putIfAbsent(r.employeeId(), r);
+        }
+        List<CsvRow> batch = new ArrayList<>(uniqueRows.values());
         jdbc.batchUpdate("""
                 INSERT INTO roster_staging
                     (tenant_id, import_id, employee_id, name, email, phone,
@@ -132,7 +138,7 @@ public class RosterImportRepository {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (tenant_id, import_id, employee_id) DO NOTHING
                 """,
-                rows,
+                batch,
                 BATCH_SIZE,
                 (PreparedStatement ps, CsvRow r) -> {
                     ps.setString(1, tenantId);
@@ -157,18 +163,25 @@ public class RosterImportRepository {
      */
     public void recordSeenIds(String tenantId, UUID importId, List<String> employeeIds) {
         if (employeeIds.isEmpty()) return;
+        java.util.Map<String, Integer> counts = new java.util.LinkedHashMap<>();
+        for (String id : employeeIds) {
+            counts.merge(id, 1, Integer::sum);
+        }
+        List<java.util.Map.Entry<String, Integer>> entries = new ArrayList<>(counts.entrySet());
+
         jdbc.batchUpdate("""
                 INSERT INTO import_seen_id (tenant_id, import_id, employee_id, occurrences)
-                VALUES (?, ?, ?, 1)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT (tenant_id, import_id, employee_id)
-                DO UPDATE SET occurrences = import_seen_id.occurrences + 1
+                DO UPDATE SET occurrences = import_seen_id.occurrences + EXCLUDED.occurrences
                 """,
-                employeeIds,
+                entries,
                 BATCH_SIZE,
-                (PreparedStatement ps, String id) -> {
+                (PreparedStatement ps, java.util.Map.Entry<String, Integer> entry) -> {
                     ps.setString(1, tenantId);
                     ps.setObject(2, importId);
-                    ps.setString(3, id);
+                    ps.setString(3, entry.getKey());
+                    ps.setInt(4, entry.getValue());
                 });
     }
 

@@ -2,7 +2,7 @@ spring:
   application:
     name: rosterguard
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/rosterguard}
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/rosterguard?reWriteBatchedInserts=true}
     username: ${DB_USER:rosterguard}
     password: ${DB_PASSWORD:rosterguard_dev}
   flyway:
