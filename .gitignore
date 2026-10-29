@@ -1,0 +1,19 @@
+# Task material - not to be published
+Case Study*.pdf
+
+# Build output
+target/
+*.class
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Secrets / local config
+.env
+
+# Generated benchmark datasets
+bench-data/
+*.csv.gen
+
