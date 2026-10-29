@@ -13,6 +13,8 @@ public final class HrEventValidator {
     public static final String INVALID_PHONE = "INVALID_PHONE";
     public static final String TOO_LONG = "TOO_LONG";
     public static final String UNKNOWN_OFFICE = "UNKNOWN_OFFICE";
+    /** Missing or unrecognised event type. */
+    public static final String INVALID_TYPE = "INVALID_TYPE";
 
     private static final Pattern ID = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
     private static final Pattern CODE = Pattern.compile("^[A-Za-z0-9_-]{1,32}$");
@@ -25,7 +27,7 @@ public final class HrEventValidator {
     public static List<FieldError> validate(HrEvent event, Set<String> knownOfficeCodes) {
         List<FieldError> errors = new ArrayList<>();
         if (event.type() == null) {
-            errors.add(new FieldError("type", REQUIRED));
+            errors.add(new FieldError("type", INVALID_TYPE));
         }
         if (event.employeeId() == null || event.employeeId().isEmpty()) {
             errors.add(new FieldError("employeeId", REQUIRED));
@@ -79,3 +81,4 @@ public final class HrEventValidator {
         return true;
     }
 }
+

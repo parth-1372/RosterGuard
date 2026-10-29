@@ -8,13 +8,18 @@ spring:
   flyway:
     enabled: true
 
+rosterguard:
+  security:
+    # No default on purpose: the app refuses to start without a secret of at least 32 bytes.
+    jwt-secret: ${JWT_SECRET:}
+    issuer: rosterguard
+
 management:
   endpoints:
     web:
       exposure:
-        include: health,metrics,prometheus
+        include: health,metrics
   endpoint:
     health:
       probes:
         enabled: true
-

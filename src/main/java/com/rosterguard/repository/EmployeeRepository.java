@@ -116,6 +116,17 @@ public class EmployeeRepository {
                 """, MAPPER, tenantId, employeeId).stream().findFirst();
     }
 
+    /** Keyset pagination: employees with ID greater than {@code after}, ordered by ID. */
+    public java.util.List<EmployeeRecord> list(String tenantId, String after, int limit) {
+        return jdbc.query("""
+                SELECT employee_id, name, email, phone, manager_id, office_code, shift_code, status,
+                       source_version, source_updated_at, roster_hash, payload_hash, applied_at,
+                       pickup_point, special_assistance, transport_version
+                FROM employee WHERE tenant_id = ? AND employee_id > ?
+                ORDER BY employee_id LIMIT ?
+                """, MAPPER, tenantId, after, limit);
+    }
+
     public long countReviews(String tenantId, String employeeId) {
         Long count = jdbc.queryForObject("""
                 SELECT count(*) FROM employee_event_review
@@ -144,3 +155,4 @@ public class EmployeeRepository {
                 rs.getLong("transport_version"));
     }
 }
+
