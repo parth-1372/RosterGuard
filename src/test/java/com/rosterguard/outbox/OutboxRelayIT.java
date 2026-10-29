@@ -186,6 +186,28 @@ class OutboxRelayIT extends PostgresIntegrationTest {
         assertThat(worker2Ids).isEmpty();
     }
 
+    @Test
+    void concurrentRelayWorkers_leasePreventsDoubleClaimEvenAfterClaimTxCommits() {
+        insertPendingEvent(T1, "LEASE-1", 100L);
+
+        // Worker 1 claims the row with a 60-second lease and COMMITS the transaction
+        List<OutboxEvent> worker1Batch = tx.execute(s -> repo.claimPending(60));
+        assertThat(worker1Batch).hasSize(1);
+        UUID claimedId = worker1Batch.get(0).id();
+
+        // Worker 1's claim transaction has committed; row lock is released in Postgres.
+        // Worker 2 attempts to claim while Worker 1 is in the middle of publishing:
+        List<OutboxEvent> worker2Batch = tx.execute(s -> repo.claimPending(60));
+
+        // Worker 2 finds 0 rows because next_attempt_at was atomically leased into the future!
+        assertThat(worker2Batch).isEmpty();
+
+        // Worker 1 finishes publishing and marks published
+        repo.markPublished(T1, claimedId);
+        OutboxEvent finalEvent = repo.find(T1, claimedId).orElseThrow();
+        assertThat(finalEvent.status()).isEqualTo("PUBLISHED");
+    }
+
     // ── 5. At-least-once delivery: failure after publish redelivers ────────────
 
     @Test
@@ -205,6 +227,9 @@ class OutboxRelayIT extends PostgresIntegrationTest {
         OutboxEvent stored = repo.find(T1, batch.get(0).id()).orElseThrow();
         assertThat(stored.status()).isEqualTo("PENDING");
 
+        // Simulate lease expiration after crash so the subsequent relay cycle reclaims
+        jdbc.update("UPDATE outbox_event SET next_attempt_at = now() - interval '1 second' WHERE id = ?", batch.get(0).id());
+
         // Next relay cycle will pick up the same event and deliver it again (at least once)
         OutboxRelay relay = new OutboxRelay(repo, publisher, tx, props);
         relay.relay();
@@ -217,3 +242,4 @@ class OutboxRelayIT extends PostgresIntegrationTest {
         assertThat(finalState.status()).isEqualTo("PUBLISHED");
     }
 }
+

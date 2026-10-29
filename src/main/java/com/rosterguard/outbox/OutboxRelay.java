@@ -55,8 +55,8 @@ public class OutboxRelay {
      */
     @Scheduled(fixedDelayString = "${rosterguard.outbox.relay-interval-ms:5000}")
     public void relay() {
-        // Each event gets its own short transaction so one bad event doesn't block others.
-        List<OutboxEvent> batch = tx.execute(s -> repo.claimPending());
+        // Atomically claim and lease rows so other workers cannot claim them after commit.
+        List<OutboxEvent> batch = tx.execute(s -> repo.claimPending(props.leaseSeconds()));
         if (batch == null || batch.isEmpty()) return;
 
         log.debug("relay claimed {} event(s)", batch.size());

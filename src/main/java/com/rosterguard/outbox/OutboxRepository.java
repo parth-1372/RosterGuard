@@ -14,14 +14,16 @@ import org.springframework.stereotype.Repository;
 /**
  * All SQL for the outbox_event table.
  *
- * <p>Relay path uses {@code FOR UPDATE SKIP LOCKED} so that concurrent relay threads claim
- * different rows and never double-deliver. Batch size is kept small (10) so lock contention
- * windows are short and the relay stays responsive under backpressure.
+ * <p>Relay path uses {@code FOR UPDATE SKIP LOCKED} combined with an atomic lease update,
+ * so that claimed rows are immediately leased (advancing next_attempt_at into the future)
+ * before the claim transaction commits and releases row locks. This prevents concurrent workers
+ * from double-claiming events even after the claim transaction commits.
  */
 @Repository
 public class OutboxRepository {
 
     static final int RELAY_BATCH = 10;
+    static final int DEFAULT_LEASE_SECONDS = 60;
 
     private static final RowMapper<OutboxEvent> MAPPER = (rs, i) -> new OutboxEvent(
             rs.getString("tenant_id"),
@@ -89,23 +91,33 @@ public class OutboxRepository {
     // ── Relay read path ───────────────────────────────────────────────────────
 
     /**
-     * Claim up to {@link #RELAY_BATCH} PENDING events whose next_attempt_at is in the past.
-     * {@code FOR UPDATE SKIP LOCKED} prevents two concurrent relay workers from claiming the
-     * same row: the second worker skips locked rows and picks the next available one.
-     *
-     * <p>Must be called inside a transaction that is held open while the publish call runs,
-     * so the row remains locked until the status is updated.
+     * Atomically claim and lease up to {@link #RELAY_BATCH} PENDING events whose next_attempt_at is in the past.
+     * {@code FOR UPDATE SKIP LOCKED} prevents concurrent workers from locking the same rows.
+     * Within the same query, {@code next_attempt_at} is advanced by {@code leaseSeconds} into the future.
+     * This ensures that when the claim transaction commits and releases row locks, other workers
+     * still cannot claim the same rows during the lease window.
      */
-    public List<OutboxEvent> claimPending() {
+    public List<OutboxEvent> claimPending(int leaseSeconds) {
         return jdbc.query("""
-                SELECT tenant_id, id, aggregate_id, event_type, dedup_key, payload,
-                       status, attempts, next_attempt_at, last_error, created_at, published_at
-                FROM outbox_event
-                WHERE status = 'PENDING' AND next_attempt_at <= now()
-                ORDER BY next_attempt_at
-                LIMIT ?
-                FOR UPDATE SKIP LOCKED
-                """, MAPPER, RELAY_BATCH);
+                WITH claimed AS (
+                    SELECT tenant_id, id
+                    FROM outbox_event
+                    WHERE status = 'PENDING' AND next_attempt_at <= now()
+                    ORDER BY next_attempt_at
+                    LIMIT ?
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE outbox_event e
+                SET next_attempt_at = now() + (CAST(? AS int) * interval '1 second')
+                FROM claimed
+                WHERE e.tenant_id = claimed.tenant_id AND e.id = claimed.id
+                RETURNING e.tenant_id, e.id, e.aggregate_id, e.event_type, e.dedup_key, e.payload,
+                          e.status, e.attempts, e.next_attempt_at, e.last_error, e.created_at, e.published_at
+                """, MAPPER, RELAY_BATCH, leaseSeconds);
+    }
+
+    public List<OutboxEvent> claimPending() {
+        return claimPending(DEFAULT_LEASE_SECONDS);
     }
 
     /** Mark an event as successfully published. */
