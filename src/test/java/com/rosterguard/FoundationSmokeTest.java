@@ -48,8 +48,9 @@ class FoundationSmokeTest {
     void employeeVersionCannotBeNegative() {
         jdbc.update("INSERT INTO tenant (id, name) VALUES ('t1', 'Tenant One')");
         try {
-            jdbc.update("INSERT INTO employee (tenant_id, employee_id, source_version, row_hash) "
-                    + "VALUES ('t1', 'E1', -1, 'x')");
+            // All other columns are valid, so only the version CHECK can reject this row.
+            jdbc.update("INSERT INTO employee (tenant_id, employee_id, source_version, roster_hash, payload_hash) "
+                    + "VALUES ('t1', 'E1', -1, repeat('a', 64), repeat('b', 64))");
             throw new AssertionError("negative version should be rejected by the CHECK constraint");
         } catch (org.springframework.dao.DataIntegrityViolationException expected) {
             // expected: database enforces the invariant, not just application code
