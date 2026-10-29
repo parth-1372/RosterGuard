@@ -1,17 +1,13 @@
 package com.rosterguard.roster;
 
-import com.rosterguard.api.ApiError;
-import com.rosterguard.api.TraceIdFilter;
-import com.rosterguard.security.Caller;
-import com.rosterguard.security.Role;
-import com.rosterguard.service.InvalidRequestException;
 import com.rosterguard.domain.FieldError;
+import com.rosterguard.security.Caller;
+import com.rosterguard.service.InvalidRequestException;
 import java.io.IOException;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.UUID;
-import org.slf4j.MDC;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.security.core.Authentication;
@@ -26,19 +22,14 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 
 /**
- * Roster CSV import endpoints.
+ * Roster CSV import endpoints. Role enforcement is done entirely in SecurityConfig;
+ * no role checks are duplicated here.
  *
  * <ul>
- *   <li>POST /api/v1/roster-imports — upload a CSV; returns the import ID and initial status</li>
- *   <li>GET  /api/v1/roster-imports/{id} — retrieve import status</li>
- *   <li>POST /api/v1/roster-imports/{id}/approve — operator approves a held import</li>
- *   <li>POST /api/v1/roster-imports/{id}/reject  — operator rejects a held import</li>
- * </ul>
- *
- * Role mapping is enforced in SecurityConfig:
- * <ul>
- *   <li>HR_INTEGRATION → POST /api/v1/roster-imports</li>
- *   <li>OPERATOR       → GET, approve, reject</li>
+ *   <li>POST   /api/v1/roster-imports            — HR_INTEGRATION: upload CSV</li>
+ *   <li>GET    /api/v1/roster-imports/{id}        — OPERATOR: get status</li>
+ *   <li>POST   /api/v1/roster-imports/{id}/approve — OPERATOR: approve held import</li>
+ *   <li>POST   /api/v1/roster-imports/{id}/reject  — OPERATOR: reject held import</li>
  * </ul>
  */
 @RestController
@@ -53,7 +44,7 @@ public class RosterImportController {
 
     /**
      * Upload a nightly CSV file. The optional {@code snapshotGeneratedAt} parameter is the
-     * HR-system clock at which the snapshot was generated; it is used for old-file protection.
+     * HR-system clock at which the snapshot was generated; used for old-file protection.
      * If absent, deactivations are held for operator review.
      */
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -64,9 +55,6 @@ public class RosterImportController {
             Authentication authentication) throws IOException {
 
         Caller caller = Caller.from(authentication);
-        if (!caller.hasRole(Role.HR_INTEGRATION)) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN);
-        }
 
         if (file == null || file.isEmpty()) {
             throw new InvalidRequestException(List.of(new FieldError("file", "REQUIRED")));
@@ -94,8 +82,7 @@ public class RosterImportController {
         UUID id = parseUuid(importId);
         return service.findImport(caller.tenantId(), id)
                 .map(ImportView::from)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
-                        "Import not found"));
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
     }
 
     @PostMapping("/{importId}/approve")
@@ -104,8 +91,7 @@ public class RosterImportController {
         UUID id = parseUuid(importId);
         return service.approve(caller.tenantId(), id, caller.userId())
                 .map(ImportView::from)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
-                        "Import not found or not in AWAITING_APPROVAL state"));
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
     }
 
     @PostMapping("/{importId}/reject")
@@ -114,8 +100,7 @@ public class RosterImportController {
         UUID id = parseUuid(importId);
         return service.reject(caller.tenantId(), id, caller.userId())
                 .map(ImportView::from)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
-                        "Import not found or not in AWAITING_APPROVAL state"));
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
     }
 
     private static UUID parseUuid(String raw) {
@@ -126,3 +111,4 @@ public class RosterImportController {
         }
     }
 }
+

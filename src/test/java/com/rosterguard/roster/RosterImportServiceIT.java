@@ -414,4 +414,39 @@ class RosterImportServiceIT extends PostgresIntegrationTest {
         // T1's import is unchanged.
         assertThat(fetch(T1, id).status()).isEqualTo(ImportStatus.AWAITING_APPROVAL);
     }
+
+    // ── 13. Null source_updated_at — employee not deactivated (safety) ────────
+
+    @Test
+    void nullSourceUpdatedAt_employeeProtectedFromDeactivation() throws IOException {
+        // Insert an employee without source_updated_at (simulates pre-V2 or incomplete HR data).
+        jdbc.update("""
+                INSERT INTO employee
+                    (tenant_id, employee_id, name, email, source_version,
+                     source_updated_at, roster_hash, payload_hash, status)
+                VALUES (?, ?, ?, ?, ?, NULL,
+                        repeat('a', 64), repeat('b', 64), 'ACTIVE')
+                """,
+                T1, "E-NULL-TS", "No Timestamp", "nullts@example.com", 1L);
+
+        // 4 normal employees so total is 5 active; importing 4 = 1 missing (20% < threshold).
+        seedEmployee(T1, "E001", 1, BEFORE_SNAPSHOT);
+        seedEmployee(T1, "E002", 1, BEFORE_SNAPSHOT);
+        seedEmployee(T1, "E003", 1, BEFORE_SNAPSHOT);
+        seedEmployee(T1, "E004", 1, BEFORE_SNAPSHOT);
+
+        // Import only E001-E004; E-NULL-TS is "missing" but has no source_updated_at.
+        String csv = row("E001", 2, BEFORE_SNAPSHOT) + "\n"
+                   + row("E002", 2, BEFORE_SNAPSHOT) + "\n"
+                   + row("E003", 2, BEFORE_SNAPSHOT) + "\n"
+                   + row("E004", 2, BEFORE_SNAPSHOT);
+        UUID id = doImport(T1, csv, SNAPSHOT);
+        ImportRecord r = fetch(T1, id);
+
+        assertThat(r.status()).isEqualTo(ImportStatus.COMPLETED);
+        // E-NULL-TS is missing from the file but must NOT be deactivated — no source watermark.
+        assertThat(statusOf(T1, "E-NULL-TS")).isEqualTo("ACTIVE");
+        // missingCount still shows it as absent.
+        assertThat(r.missingCount()).isEqualTo(1);
+    }
 }

@@ -15,6 +15,7 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
@@ -73,6 +74,29 @@ public class ApiExceptionHandler {
     ResponseEntity<ApiError> denied(AccessDeniedException e) {
         return respond(HttpStatus.FORBIDDEN, "FORBIDDEN",
                 "You do not have permission to perform this operation");
+    }
+
+    /**
+     * ResponseStatusException is thrown by controllers for 404/400 cases where no domain
+     * exception exists yet. Maps to ApiError so the response shape is consistent.
+     */
+    @ExceptionHandler(ResponseStatusException.class)
+    ResponseEntity<ApiError> statusEx(ResponseStatusException e) {
+        HttpStatus status = HttpStatus.resolve(e.getStatusCode().value());
+        if (status == null) status = HttpStatus.INTERNAL_SERVER_ERROR;
+        String code = switch (status) {
+            case NOT_FOUND -> "NOT_FOUND";
+            case BAD_REQUEST -> "BAD_REQUEST";
+            case FORBIDDEN -> "FORBIDDEN";
+            default -> "ERROR";
+        };
+        String message = switch (status) {
+            case NOT_FOUND -> "The requested resource was not found";
+            case BAD_REQUEST -> "The request is invalid";
+            case FORBIDDEN -> "You do not have permission to perform this operation";
+            default -> "An error occurred";
+        };
+        return respond(status, code, message);
     }
 
     @ExceptionHandler(Exception.class)

@@ -284,11 +284,15 @@ public class RosterImportRepository {
 
     /**
      * Deactivate employees who are ACTIVE and absent from the snapshot, but only when their
-     * {@code source_updated_at} is earlier than or equal to {@code snapshotGeneratedAt}
+     * {@code source_updated_at} is known and earlier than or equal to {@code snapshotGeneratedAt}
      * (old-file protection: D1b).
      *
-     * <p>An employee whose HR record is newer than the snapshot is NOT deactivated even if
-     * they are missing — we cannot trust that the snapshot is authoritative for them.
+     * <p>Employees whose {@code source_updated_at} is NULL are intentionally skipped: without a
+     * source watermark we cannot determine whether the snapshot is authoritative for that employee,
+     * so deactivation is unsafe.
+     *
+     * <p>An employee whose HR record is newer than the snapshot is also NOT deactivated — we
+     * cannot trust that the snapshot is authoritative for them.
      *
      * @return number of employees deactivated
      */
@@ -305,7 +309,8 @@ public class RosterImportRepository {
                         AND s.import_id = ?
                         AND s.employee_id = e.employee_id
                   )
-                  AND (e.source_updated_at IS NULL OR e.source_updated_at <= ?)
+                  AND e.source_updated_at IS NOT NULL
+                  AND e.source_updated_at <= ?
                 """, tenantId, importId, toDb(snapshotGeneratedAt));
     }
 
