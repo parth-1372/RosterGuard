@@ -231,17 +231,21 @@ curl -i -X PUT http://localhost:8080/api/v1/employees/E-101/transport \
 
 ### 5. Execute Nightly CSV Import
 ```bash
-# Upload a roster CSV snapshot
-curl -i -X POST http://localhost:8080/api/v1/roster/imports \
-  -H "Authorization: Bearer $OP_TOKEN" \
+# Upload a roster CSV snapshot (HR_INTEGRATION role)
+curl -i -X POST http://localhost:8080/api/v1/roster-imports \
+  -H "Authorization: Bearer $HR_TOKEN" \
   -F "file=@sample_roster.csv" \
   -F "snapshotGeneratedAt=2024-01-15T12:00:00Z"
+
+# Inspect import status and statistics (OPERATOR role)
+curl -s -X GET http://localhost:8080/api/v1/roster-imports/<IMPORT_ID> \
+  -H "Authorization: Bearer $OP_TOKEN" | jq .
 ```
 
 ### 6. Monitor Transactional Outbox
 ```bash
 # View pending outbox events (operator only)
-curl -s -X GET http://localhost:8080/api/v1/ops/outbox/pending \
+curl -s -X GET "http://localhost:8080/api/v1/ops/outbox?status=PENDING" \
   -H "Authorization: Bearer $OP_TOKEN" | jq .
 ```
 

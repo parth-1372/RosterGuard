@@ -230,13 +230,12 @@ public class RosterImportRepository {
                 SELECT count(*) FROM employee e
                 WHERE e.tenant_id = ?
                   AND e.status = 'ACTIVE'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM import_seen_id s
-                      WHERE s.tenant_id = e.tenant_id
+                  AND e.employee_id NOT IN (
+                      SELECT s.employee_id FROM import_seen_id s
+                      WHERE s.tenant_id = ?
                         AND s.import_id = ?
-                        AND s.employee_id = e.employee_id
                   )
-                """, Integer.class, tenantId, importId);
+                """, Integer.class, tenantId, tenantId, importId);
         return n == null ? 0 : n;
     }
 
@@ -325,16 +324,15 @@ public class RosterImportRepository {
                     applied_at = now()
                 WHERE e.tenant_id = ?
                   AND e.status = 'ACTIVE'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM import_seen_id s
-                      WHERE s.tenant_id = e.tenant_id
+                  AND e.employee_id NOT IN (
+                      SELECT s.employee_id FROM import_seen_id s
+                      WHERE s.tenant_id = ?
                         AND s.import_id = ?
-                        AND s.employee_id = e.employee_id
                   )
                   AND e.source_updated_at IS NOT NULL
                   AND e.source_updated_at <= ?
                 RETURNING e.employee_id
-                """, String.class, tenantId, importId, toDb(snapshotGeneratedAt));
+                """, String.class, tenantId, tenantId, importId, toDb(snapshotGeneratedAt));
 
         for (String empId : deactivatedIds) {
             List<UUID> cancelledBookings = deactivations.cancelFutureBookings(tenantId, empId);

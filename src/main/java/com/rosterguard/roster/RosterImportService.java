@@ -197,12 +197,16 @@ public class RosterImportService {
             }
         }
 
-        // ── 4. Apply upserts + deactivations in a single transaction ─────────
+        // ── 4. Apply deactivations (if any missing) + upserts in a single transaction ──
         int newCount = imports.countNew(tenantId, importId);
         int changed  = imports.countChanged(tenantId, importId);
         int deactivated = tx.execute(status -> {
+            int d = 0;
+            if (missing > 0 && snapshotGeneratedAt != null) {
+                d = imports.applyDeactivations(tenantId, importId, snapshotGeneratedAt);
+            }
             applyUpserts(tenantId, importId);
-            return imports.applyDeactivations(tenantId, importId, snapshotGeneratedAt);
+            return d;
         });
 
         log.info("import completed tenant={} importId={} new={} changed={} deactivated={}",

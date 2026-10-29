@@ -12,8 +12,12 @@ import java.io.FileInputStream;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryPoolMXBean;
+import java.lang.management.MemoryType;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,8 +26,13 @@ import org.springframework.beans.factory.annotation.Autowired;
  * Benchmark 1: Full-scale CSV reconciliation with 200,000 rows.
  * Target: Completion within 60 seconds and capped heap memory &lt; 256 MB.
  *
- * <p>Records environment details, warm-up runs, breakdown of streaming/staging/diffing/applying,
- * peak heap utilization, and raw timings.
+ * <p>Peak heap memory measurement methodology:
+ * <ul>
+ *   <li>Pre-execution JIT warmup and full GC.</li>
+ *   <li>Reset of all JVM heap memory pool peak counters ({@link MemoryPoolMXBean#resetPeakUsage()}).</li>
+ *   <li>Continuous background sampling thread polling {@link MemoryMXBean#getHeapMemoryUsage()} every 50 ms.</li>
+ *   <li>Post-execution peak memory evaluation combining pool peaks and sampler maximum.</li>
+ * </ul>
  */
 @Tag("benchmark")
 class CsvReconciliationBenchmark extends PostgresIntegrationTest {
@@ -34,8 +43,26 @@ class CsvReconciliationBenchmark extends PostgresIntegrationTest {
     private static final MemoryMXBean MEMORY_BEAN = ManagementFactory.getMemoryMXBean();
 
     private static long currentHeapMb() {
-        System.gc();
         return MEMORY_BEAN.getHeapMemoryUsage().getUsed() / (1024 * 1024);
+    }
+
+    private static void resetPoolPeaks() {
+        System.gc();
+        for (MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
+            if (pool.getType() == MemoryType.HEAP) {
+                pool.resetPeakUsage();
+            }
+        }
+    }
+
+    private static long getPoolPeakMb() {
+        long peakBytes = 0;
+        for (MemoryPoolMXBean pool : ManagementFactory.getMemoryPoolMXBeans()) {
+            if (pool.getType() == MemoryType.HEAP) {
+                peakBytes += pool.getPeakUsage().getUsed();
+            }
+        }
+        return peakBytes / (1024 * 1024);
     }
 
     @Test
@@ -72,21 +99,45 @@ class CsvReconciliationBenchmark extends PostgresIntegrationTest {
         long fileSizeMb = csvFile.length() / (1024 * 1024);
         System.out.printf("[Dataset] Generated %d rows (%d MB) in %d ms.\n\n", rowCount, fileSizeMb, genDuration);
 
-        // ── 3. Benchmark Execution ───────────────────────────────────────────
+        // ── 3. Benchmark Execution with Active Heap Sampling ──────────────────
+        resetPoolPeaks();
         long heapBeforeMb = currentHeapMb();
         System.out.println("[Execution] Starting 200,000-row import (initial bulk insert)...");
         System.out.printf("[Memory] Baseline Heap: %d MB\n", heapBeforeMb);
+
+        AtomicBoolean running = new AtomicBoolean(true);
+        AtomicLong maxObservedHeapBytes = new AtomicLong(MEMORY_BEAN.getHeapMemoryUsage().getUsed());
+
+        Thread sampler = new Thread(() -> {
+            while (running.get()) {
+                long used = MEMORY_BEAN.getHeapMemoryUsage().getUsed();
+                maxObservedHeapBytes.accumulateAndGet(used, Math::max);
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "heap-sampler");
+        sampler.setDaemon(true);
+        sampler.start();
 
         long startTime = System.currentTimeMillis();
         UUID importId;
         try (InputStream in = new BufferedInputStream(new FileInputStream(csvFile), 64 * 1024)) {
             importId = service.importCsv(T1, in, snapshotTime);
+        } finally {
+            running.set(false);
+            sampler.join(500);
         }
         long durationMs = System.currentTimeMillis() - startTime;
         double durationSec = durationMs / 1000.0;
 
         long heapAfterMb = currentHeapMb();
-        long peakHeapMb = Math.max(heapBeforeMb, heapAfterMb);
+        long sampledPeakMb = maxObservedHeapBytes.get() / (1024 * 1024);
+        long poolPeakMb = getPoolPeakMb();
+        long truePeakHeapMb = Math.max(sampledPeakMb, poolPeakMb);
 
         // ── 4. Verification ──────────────────────────────────────────────────
         ImportRecord record = service.findImport(T1, importId).orElseThrow();
@@ -106,17 +157,18 @@ class CsvReconciliationBenchmark extends PostgresIntegrationTest {
         System.out.printf("  Total Rows:           %,d\n", rowCount);
         System.out.printf("  Total Time:           %.2f seconds (%d ms)\n", durationSec, durationMs);
         System.out.printf("  Throughput:           %,.0f rows/second\n", rowCount / durationSec);
-        System.out.printf("  Initial Heap:         %d MB\n", heapBeforeMb);
-        System.out.printf("  Final Heap:           %d MB\n", heapAfterMb);
-        System.out.printf("  Estimated Peak Heap:  %d MB (Cap: 256 MB)\n", peakHeapMb);
+        System.out.printf("  Baseline Heap:        %d MB\n", heapBeforeMb);
+        System.out.printf("  Post-Import Heap:     %d MB\n", heapAfterMb);
+        System.out.printf("  Sampled Peak Heap:    %d MB (50ms interval)\n", sampledPeakMb);
+        System.out.printf("  Pool Peak Heap:       %d MB (MemoryPoolMXBean)\n", poolPeakMb);
+        System.out.printf("  Peak Heap Utilized:   %d MB (Capped Threshold: 256 MB)\n", truePeakHeapMb);
         System.out.println("--------------------------------------------------------------------------------");
 
         System.out.printf("PASS/FAIL EVALUATION:\n");
         System.out.printf("  Target 1 (Time <= 60s):      %s (%.2f s)\n",
                 (durationSec <= 60.0 ? "PASS" : "FAIL"), durationSec);
         System.out.printf("  Target 2 (Peak Heap <= 256MB): %s (%d MB)\n",
-                (peakHeapMb <= 256 ? "PASS" : "FAIL"), peakHeapMb);
+                (truePeakHeapMb <= 256 ? "PASS" : "FAIL"), truePeakHeapMb);
         System.out.println("================================================================================");
     }
 }
-
