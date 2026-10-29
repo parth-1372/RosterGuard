@@ -19,9 +19,10 @@ services:
       db:
         condition: service_healthy
     environment:
-      DB_URL: jdbc:postgresql://db:5432/rosterguard
+      DB_URL: jdbc:postgresql://db:5432/rosterguard?reWriteBatchedInserts=true
       DB_USER: rosterguard
       DB_PASSWORD: ${DB_PASSWORD:-rosterguard_dev}
+      JWT_SECRET: ${JWT_SECRET:-dev-insecure-secret-key-for-local-demo-at-least-32-chars-long}
+      SPRING_PROFILES_ACTIVE: dev
     ports:
       - "8080:8080"
-
