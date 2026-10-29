@@ -130,6 +130,14 @@ public class SecurityConfig {
                 a.requestMatchers(HttpMethod.GET, "/api/v1/employees/*")
                         .hasAnyRole(Role.TRANSPORT_ADMIN.name(), Role.OPERATOR.name(),
                                 Role.EMPLOYEE.name());
+                // Roster import: upload by HR_INTEGRATION, manage by OPERATOR.
+                a.requestMatchers(HttpMethod.POST, "/api/v1/roster-imports")
+                        .hasRole(Role.HR_INTEGRATION.name());
+                a.requestMatchers(HttpMethod.GET, "/api/v1/roster-imports/*")
+                        .hasRole(Role.OPERATOR.name());
+                a.requestMatchers(HttpMethod.POST, "/api/v1/roster-imports/*/approve",
+                        "/api/v1/roster-imports/*/reject")
+                        .hasRole(Role.OPERATOR.name());
                 a.requestMatchers("/actuator/**").hasRole(Role.OPERATOR.name());
                 a.anyRequest().denyAll();
             });
