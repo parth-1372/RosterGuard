@@ -1,0 +1,17 @@
+# Test-only overrides. This file is loaded by every @SpringBootTest context.
+# The secret only needs to meet the 32-byte minimum; it has no security value outside CI.
+rosterguard:
+  security:
+    jwt-secret: test-secret-used-only-in-automated-tests-32plus
+    issuer: rosterguard
+
+# Actuator: keep health open so FoundationSmokeTest can hit it without a token.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
