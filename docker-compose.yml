@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rosterguard
+      POSTGRES_USER: rosterguard
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-rosterguard_dev}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rosterguard -d rosterguard"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/rosterguard
+      DB_USER: rosterguard
+      DB_PASSWORD: ${DB_PASSWORD:-rosterguard_dev}
+    ports:
+      - "8080:8080"
+

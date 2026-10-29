@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: rosterguard
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/rosterguard}
+    username: ${DB_USER:rosterguard}
+    password: ${DB_PASSWORD:rosterguard_dev}
+  flyway:
+    enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
