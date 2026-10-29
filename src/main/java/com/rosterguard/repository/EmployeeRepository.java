@@ -2,12 +2,16 @@ package com.rosterguard.repository;
 
 import com.rosterguard.domain.HrEventType;
 import com.rosterguard.domain.HrProfile;
+import com.rosterguard.outbox.DeactivationRepository;
+import com.rosterguard.outbox.OutboxRepository;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -28,9 +32,14 @@ public class EmployeeRepository {
     private static final RowMapper<EmployeeRecord> MAPPER = EmployeeRepository::map;
 
     private final JdbcTemplate jdbc;
+    private final DeactivationRepository deactivations;
+    private final OutboxRepository outbox;
 
-    public EmployeeRepository(JdbcTemplate jdbc) {
+    public EmployeeRepository(JdbcTemplate jdbc, DeactivationRepository deactivations,
+                               OutboxRepository outbox) {
         this.jdbc = jdbc;
+        this.deactivations = deactivations;
+        this.outbox = outbox;
     }
 
     /**
@@ -71,6 +80,24 @@ public class EmployeeRepository {
                 WHERE tenant_id = ? AND employee_id = ? AND source_version < ?
                 """,
                 version, toDb(sourceUpdatedAt), payloadHash, tenantId, employeeId, version) > 0;
+    }
+
+    /**
+     * Deactivate an employee and atomically execute side effects in the caller's transaction:
+     * cancel future bookings, release their seats, and insert an outbox event.
+     *
+     * <p>Must be called within an active Spring transaction. Returns true if the employee row
+     * was updated (version guard passed), false if the event was stale/duplicate.
+     */
+    public boolean deactivateWithSideEffects(String tenantId, String employeeId, long version,
+                                             Instant sourceUpdatedAt, String payloadHash) {
+        boolean applied = deactivate(tenantId, employeeId, version, sourceUpdatedAt, payloadHash);
+        if (!applied) return false;
+
+        List<UUID> cancelledBookings = deactivations.cancelFutureBookings(tenantId, employeeId);
+        deactivations.releaseSeats(tenantId, cancelledBookings);
+        outbox.insertDeactivationEvent(tenantId, employeeId, version);
+        return true;
     }
 
     public Optional<VersionInfo> findVersionInfo(String tenantId, String employeeId) {

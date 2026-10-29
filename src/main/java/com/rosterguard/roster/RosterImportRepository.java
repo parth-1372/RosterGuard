@@ -1,7 +1,8 @@
 package com.rosterguard.roster;
 
+import com.rosterguard.outbox.DeactivationRepository;
+import com.rosterguard.outbox.OutboxRepository;
 import java.sql.PreparedStatement;
-import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -42,9 +43,14 @@ public class RosterImportRepository {
     );
 
     private final JdbcTemplate jdbc;
+    private final DeactivationRepository deactivations;
+    private final OutboxRepository outbox;
 
-    public RosterImportRepository(JdbcTemplate jdbc) {
+    public RosterImportRepository(JdbcTemplate jdbc, DeactivationRepository deactivations,
+                                  OutboxRepository outbox) {
         this.jdbc = jdbc;
+        this.deactivations = deactivations;
+        this.outbox = outbox;
     }
 
     // ── Import lifecycle ──────────────────────────────────────────────────────
@@ -294,10 +300,13 @@ public class RosterImportRepository {
      * <p>An employee whose HR record is newer than the snapshot is also NOT deactivated — we
      * cannot trust that the snapshot is authoritative for them.
      *
+     * <p>For each deactivated employee, future bookings are cancelled, seats released, and an
+     * outbox event is inserted in the caller's transaction.
+     *
      * @return number of employees deactivated
      */
     public int applyDeactivations(String tenantId, UUID importId, Instant snapshotGeneratedAt) {
-        return jdbc.update("""
+        List<String> deactivatedIds = jdbc.queryForList("""
                 UPDATE employee e SET
                     status = 'INACTIVE',
                     applied_at = now()
@@ -311,7 +320,15 @@ public class RosterImportRepository {
                   )
                   AND e.source_updated_at IS NOT NULL
                   AND e.source_updated_at <= ?
-                """, tenantId, importId, toDb(snapshotGeneratedAt));
+                RETURNING e.employee_id
+                """, String.class, tenantId, importId, toDb(snapshotGeneratedAt));
+
+        for (String empId : deactivatedIds) {
+            List<UUID> cancelledBookings = deactivations.cancelFutureBookings(tenantId, empId);
+            deactivations.releaseSeats(tenantId, cancelledBookings);
+            outbox.insertCsvDeactivationEvent(tenantId, empId, importId);
+        }
+        return deactivatedIds.size();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -324,4 +341,3 @@ public class RosterImportRepository {
         return value == null ? null : value.toInstant();
     }
 }
-

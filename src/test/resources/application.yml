@@ -4,6 +4,9 @@ rosterguard:
   security:
     jwt-secret: test-secret-used-only-in-automated-tests-32plus
     issuer: rosterguard
+  outbox:
+    relay-interval-ms: 60000
+    max-attempts: 3
 
 # Actuator: keep health open so FoundationSmokeTest can hit it without a token.
 management:

@@ -13,6 +13,9 @@ rosterguard:
     # No default on purpose: the app refuses to start without a secret of at least 32 bytes.
     jwt-secret: ${JWT_SECRET:}
     issuer: rosterguard
+  outbox:
+    relay-interval-ms: ${OUTBOX_RELAY_INTERVAL_MS:5000}
+    max-attempts: ${OUTBOX_MAX_ATTEMPTS:5}
 
 management:
   endpoints:

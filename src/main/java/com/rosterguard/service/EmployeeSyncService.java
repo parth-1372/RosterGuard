@@ -78,7 +78,7 @@ public class EmployeeSyncService {
         String payloadHash = CanonicalHasher.payloadHash(event.type(), event.effectiveProfile());
 
         boolean applied = event.type() == HrEventType.DEACTIVATE
-                ? employees.deactivate(tenantId, id, version, event.sourceUpdatedAt(), payloadHash)
+                ? employees.deactivateWithSideEffects(tenantId, id, version, event.sourceUpdatedAt(), payloadHash)
                 : employees.upsertHr(tenantId, id, version, event.sourceUpdatedAt(),
                         event.effectiveProfile(),
                         CanonicalHasher.rosterHash(event.effectiveProfile()), payloadHash);

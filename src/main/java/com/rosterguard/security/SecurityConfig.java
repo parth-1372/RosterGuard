@@ -138,6 +138,9 @@ public class SecurityConfig {
                 a.requestMatchers(HttpMethod.POST, "/api/v1/roster-imports/*/approve",
                         "/api/v1/roster-imports/*/reject")
                         .hasRole(Role.OPERATOR.name());
+                // Operator-only outbox monitoring.
+                a.requestMatchers("/api/v1/ops/outbox", "/api/v1/ops/outbox/**")
+                        .hasRole(Role.OPERATOR.name());
                 a.requestMatchers("/actuator/**").hasRole(Role.OPERATOR.name());
                 a.anyRequest().denyAll();
             });

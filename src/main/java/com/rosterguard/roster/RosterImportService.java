@@ -31,7 +31,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *     </ul>
  *   </li>
  *   <li>Apply upserts (set-based INSERT … ON CONFLICT).</li>
- *   <li>Apply deactivations guarded by source_updated_at &le; snapshotGeneratedAt.</li>
+ *   <li>Apply deactivations guarded by source_updated_at &le; snapshotGeneratedAt,
+ *       cancelling future bookings, releasing seats, and enqueuing outbox events in the same transaction.</li>
  *   <li>Finalise the import record.</li>
  * </ol>
  *
@@ -190,17 +191,19 @@ public class RosterImportService {
                 log.warn("import awaiting approval (threshold) tenant={} importId={} ratio={}",
                         tenantId, importId, String.format("%.2f", missingRatio));
                 finalise(tenantId, importId, ImportStatus.AWAITING_APPROVAL,
-                        activeCountAtStart, (int) totalRows, rejectedRows,
-                        newCount, changed, missing, HoldReason.MISSING_THRESHOLD_EXCEEDED);
+                    activeCountAtStart, (int) totalRows, rejectedRows,
+                    newCount, changed, missing, HoldReason.MISSING_THRESHOLD_EXCEEDED);
                 return importId;
             }
         }
 
-        // ── 4. Apply upserts + deactivations ────────────────────────────────
+        // ── 4. Apply upserts + deactivations in a single transaction ─────────
         int newCount = imports.countNew(tenantId, importId);
         int changed  = imports.countChanged(tenantId, importId);
-        applyUpserts(tenantId, importId);
-        int deactivated = imports.applyDeactivations(tenantId, importId, snapshotGeneratedAt);
+        int deactivated = tx.execute(status -> {
+            applyUpserts(tenantId, importId);
+            return imports.applyDeactivations(tenantId, importId, snapshotGeneratedAt);
+        });
 
         log.info("import completed tenant={} importId={} new={} changed={} deactivated={}",
                 tenantId, importId, newCount, changed, deactivated);
@@ -211,22 +214,22 @@ public class RosterImportService {
         return importId;
     }
 
-    /** Apply the approve decision: run deactivations, then mark COMPLETED. */
+    /** Apply the approve decision: run deactivations, then mark COMPLETED in a single transaction. */
     public Optional<ImportRecord> approve(String tenantId, UUID importId, String operatorId) {
-        Optional<ImportRecord> rec = imports.find(tenantId, importId);
-        if (rec.isEmpty() || rec.get().status() != ImportStatus.AWAITING_APPROVAL) {
-            return Optional.empty();
-        }
-        ImportRecord r = rec.get();
-        // Re-run deactivations only if we now have a watermark (NO_SNAPSHOT_WATERMARK holds skip them).
-        if (r.snapshotGeneratedAt() != null
-                && HoldReason.NO_SNAPSHOT_WATERMARK.name().equals(r.holdReason())) {
-            // Operator approved despite missing watermark: still no deactivations.
-        } else if (r.snapshotGeneratedAt() != null) {
-            imports.applyDeactivations(tenantId, importId, r.snapshotGeneratedAt());
-        }
-        imports.approve(tenantId, importId, operatorId);
-        return imports.find(tenantId, importId);
+        return tx.execute(status -> {
+            Optional<ImportRecord> rec = imports.find(tenantId, importId);
+            if (rec.isEmpty() || rec.get().status() != ImportStatus.AWAITING_APPROVAL) {
+                return Optional.empty();
+            }
+            ImportRecord r = rec.get();
+            // Re-run deactivations only if we have a watermark (NO_SNAPSHOT_WATERMARK holds skip them).
+            if (r.snapshotGeneratedAt() != null
+                    && !HoldReason.NO_SNAPSHOT_WATERMARK.name().equals(r.holdReason())) {
+                imports.applyDeactivations(tenantId, importId, r.snapshotGeneratedAt());
+            }
+            imports.approve(tenantId, importId, operatorId);
+            return imports.find(tenantId, importId);
+        });
     }
 
     public Optional<ImportRecord> reject(String tenantId, UUID importId, String operatorId) {
@@ -257,4 +260,3 @@ public class RosterImportService {
                 newCount, changedCount, missingCount, holdReason);
     }
 }
-
