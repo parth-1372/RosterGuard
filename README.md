@@ -106,7 +106,29 @@ flowchart TD
 
 ---
 
-## 3. Empirically Verified Benchmarks (Milestone 6)
+## 3. REST API Overview
+
+All tenant endpoints enforce stateless JWT authentication with claims `tenant` and `roles`. Tenant scoping is derived strictly from the cryptographically verified token claim.
+
+| Method | Endpoint | Allowed Roles | Description |
+|---|---|---|---|
+| `POST` | `/api/dev/token` | *Unauthenticated* *(profile `dev` only)* | Mint test JWT with custom tenant & roles |
+| `POST` | `/api/v1/employees/events` | `HR_INTEGRATION` | Ingest real-time HR event (CREATE, UPDATE, DEACTIVATE) |
+| `GET` | `/api/v1/employees/{id}` | `EMPLOYEE` *(self)*, `TRANSPORT_ADMIN`, `OPERATOR` | Read employee profile |
+| `GET` | `/api/v1/employees` | `TRANSPORT_ADMIN`, `OPERATOR` | Keyset-paginated directory of tenant employees |
+| `PUT` | `/api/v1/employees/{id}/transport` | `TRANSPORT_ADMIN` | Update pickup point & assistance (emits outbox event) |
+| `POST` | `/api/v1/roster-imports` | `HR_INTEGRATION` | Stream nightly CSV snapshot (max 32MB file / 34MB req) |
+| `GET` | `/api/v1/roster-imports/{id}` | `OPERATOR` | Inspect import reconciliation status & counters |
+| `GET` | `/api/v1/roster-imports/{id}/errors`| `OPERATOR` | Paginated PII-safe row-level syntax errors |
+| `POST` | `/api/v1/roster-imports/{id}/approve`| `OPERATOR` | Approve held import (atomic deactivation & watermark) |
+| `POST` | `/api/v1/roster-imports/{id}/reject` | `OPERATOR` | Reject held import |
+| `GET` | `/api/v1/ops/outbox` | `OPERATOR` | Monitor outbox events with composite keyset pagination |
+| `GET` | `/api/v1/ops/outbox/{id}` | `OPERATOR` | Fetch single outbox event details |
+| `GET` | `/actuator/health` | *Public* | Liveness and readiness health probe |
+
+---
+
+## 4. Empirically Verified Benchmarks (Milestone 6)
 
 All benchmarks were measured on Windows 11 AMD64 (32 logical cores) using JDK 21.0.13 and PostgreSQL 16 via Testcontainers.
 
@@ -143,7 +165,7 @@ Measured over 1,000 real-time events across worker concurrency levels:
 
 ---
 
-## 4. Failure Modes & Mitigation Matrix
+## 5. Failure Modes & Mitigation Matrix
 
 | Failure Mode | Trigger / Scenario | RosterGuard Mitigation | Automated Test |
 |---|---|---|---|
@@ -158,10 +180,13 @@ Measured over 1,000 real-time events across worker concurrency levels:
 | **F9: Worker Crash on Publish** | Relay crashes after sending message | Atomic CTE lease expires after 60s; retried by next worker (**at least once**). | `OutboxRelayIT` |
 | **F10: Repeated Downstream Outage**| Downstream publisher down | Exponential backoff (`base * 2^attempts`); moves to `FAILED` DLQ after 5 attempts. | `OutboxRelayIT` |
 | **F11: Approval / Rejection Race**| Two operators concurrently click approve/reject | Atomic conditional status update allows exactly one winner; duplicate calls return empty. | `RosterImportSafetyGatesIT` |
+| **F12: Missing Employee IDs** | Row in CSV snapshot has missing/blank ID | Safety brake trips (`NEEDS_REVIEW`); zero deactivations occur. | `LargeFileResilienceTest` |
+| **F13: Concurrent Transport Updates**| Two transport admins edit pickup point simultaneously | Atomically increments internal `transport_version` with last-write-wins; emits distinct outbox event. | `TransportFieldServiceIT` |
+| **F14: Single Record Batch Isolation**| Malformed row within multi-event batch or CSV | Invalid row captured in error report without failing valid rows in the same batch. | `EmployeeEventControllerIT` |
 
 ---
 
-## 5. Quickstart & Reproducible Demo
+## 6. Quickstart & Reproducible Demo
 
 ### Prerequisites
 - Docker & Docker Compose
@@ -268,7 +293,7 @@ curl -s -X GET "http://localhost:8080/api/v1/ops/outbox?status=PENDING&limit=20"
 
 ---
 
-## 6. Running Tests
+## 7. Running Tests
 
 ```bash
 # Run all 189 correctness and integration tests (requires Docker for Testcontainers)
@@ -281,7 +306,7 @@ mvn test -Dtest=EventIngestionBenchmark
 
 ---
 
-## 7. Limitations & Production Scale Considerations
+## 8. Limitations & Production Scale Considerations
 
 1. **At-Least-Once Outbox Delivery:** Workers guarantee at-least-once delivery. If a worker process is terminated after delivering an event to an external broker but before committing the status in PostgreSQL, redelivery will occur. Downstream consumers must deduplicate events by `id` or `dedup_key`.
 2. **Transport Edits Concurrency:** Transport field updates use last-write-wins with an internal `transport_version`. In high-concurrency transport admin environments, optimistic locking (`ETag` / `If-Match`) should be introduced.

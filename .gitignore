@@ -4,6 +4,7 @@ Case Study*.pdf
 # Build output
 target/
 *.class
+
 # IDE
 .idea/
 .vscode/
@@ -17,3 +18,4 @@ bench-data/
 *.csv.gen
 
 docs/
+demo/
