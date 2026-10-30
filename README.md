@@ -232,17 +232,17 @@ curl -i -X POST http://localhost:8080/api/v1/employees/events \
   -H "Authorization: Bearer $HR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "eventType": "CREATE",
-    "employeeId": "E-101",
-    "sourceVersion": 1,
-    "sourceUpdatedAt": "2024-01-15T09:00:00Z",
-    "profile": {
+    "events": [{
+      "type": "CREATE",
+      "employeeId": "E-101",
+      "sourceVersion": 1,
+      "sourceUpdatedAt": "2024-01-15T09:00:00Z",
       "name": "Alice Johnson",
       "email": "alice@company.com",
       "phone": "+919876543210",
       "officeCode": "BLR",
       "shiftCode": "GENERAL"
-    }
+    }]
   }'
 
 # Update employee E-101 (version 2)
@@ -250,17 +250,17 @@ curl -i -X POST http://localhost:8080/api/v1/employees/events \
   -H "Authorization: Bearer $HR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "eventType": "UPDATE",
-    "employeeId": "E-101",
-    "sourceVersion": 2,
-    "sourceUpdatedAt": "2024-01-15T10:00:00Z",
-    "profile": {
+    "events": [{
+      "type": "UPDATE",
+      "employeeId": "E-101",
+      "sourceVersion": 2,
+      "sourceUpdatedAt": "2024-01-15T10:00:00Z",
       "name": "Alice Johnson",
       "email": "alice.j@company.com",
       "phone": "+919876543210",
       "officeCode": "BLR",
       "shiftCode": "NIGHT"
-    }
+    }]
   }'
 ```
 
