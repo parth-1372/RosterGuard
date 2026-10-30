@@ -1,5 +1,11 @@
 # Test-only overrides. This file is loaded by every @SpringBootTest context.
 # The secret only needs to meet the 32-byte minimum; it has no security value outside CI.
+spring:
+  servlet:
+    multipart:
+      max-file-size: 32MB
+      max-request-size: 34MB
+
 rosterguard:
   security:
     jwt-secret: test-secret-used-only-in-automated-tests-32plus
@@ -7,6 +13,9 @@ rosterguard:
   outbox:
     relay-interval-ms: 60000
     max-attempts: 3
+    lease-seconds: 60
+  roster:
+    missing-threshold: 0.30
 
 # Actuator: keep health open so FoundationSmokeTest can hit it without a token.
 management:

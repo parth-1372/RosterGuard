@@ -28,6 +28,7 @@ import org.springframework.web.server.ResponseStatusException;
  * <ul>
  *   <li>POST   /api/v1/roster-imports            — HR_INTEGRATION: upload CSV</li>
  *   <li>GET    /api/v1/roster-imports/{id}        — OPERATOR: get status</li>
+ *   <li>GET    /api/v1/roster-imports/{id}/errors — OPERATOR: get paginated error report</li>
  *   <li>POST   /api/v1/roster-imports/{id}/approve — OPERATOR: approve held import</li>
  *   <li>POST   /api/v1/roster-imports/{id}/reject  — OPERATOR: reject held import</li>
  * </ul>
@@ -85,6 +86,18 @@ public class RosterImportController {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
     }
 
+    @GetMapping("/{importId}/errors")
+    public List<ImportErrorRecord> getErrors(
+            @PathVariable String importId,
+            @RequestParam(value = "after", required = false) Long after,
+            @RequestParam(value = "limit", defaultValue = "50") int limit,
+            Authentication authentication) {
+        Caller caller = Caller.from(authentication);
+        UUID id = parseUuid(importId);
+        return service.listErrors(caller.tenantId(), id, after, limit)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+    }
+
     @PostMapping("/{importId}/approve")
     public ImportView approve(@PathVariable String importId, Authentication authentication) {
         Caller caller = Caller.from(authentication);
@@ -111,4 +124,3 @@ public class RosterImportController {
         }
     }
 }
-

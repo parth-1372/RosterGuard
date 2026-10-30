@@ -133,7 +133,7 @@ public class SecurityConfig {
                 // Roster import: upload by HR_INTEGRATION, manage by OPERATOR.
                 a.requestMatchers(HttpMethod.POST, "/api/v1/roster-imports")
                         .hasRole(Role.HR_INTEGRATION.name());
-                a.requestMatchers(HttpMethod.GET, "/api/v1/roster-imports/*")
+                a.requestMatchers(HttpMethod.GET, "/api/v1/roster-imports/**")
                         .hasRole(Role.OPERATOR.name());
                 a.requestMatchers(HttpMethod.POST, "/api/v1/roster-imports/*/approve",
                         "/api/v1/roster-imports/*/reject")

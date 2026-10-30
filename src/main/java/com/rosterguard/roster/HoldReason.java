@@ -15,6 +15,9 @@ public enum HoldReason {
      * snapshotGeneratedAt was not supplied by the caller. Without a comparable source watermark
      * we cannot safely protect against old-file overwrites, so deactivations are blocked.
      */
-    NO_SNAPSHOT_WATERMARK
+    NO_SNAPSHOT_WATERMARK,
+    /** The snapshot timestamp is earlier than or equal to the tenant's latest processed snapshot. */
+    STALE_SNAPSHOT,
+    /** The CSV header row was invalid (e.g. missing required columns, duplicates, or unexpected columns). */
+    INVALID_HEADER
 }
-

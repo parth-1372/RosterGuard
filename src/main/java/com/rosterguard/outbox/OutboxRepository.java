@@ -1,5 +1,6 @@
 package com.rosterguard.outbox;
 
+import com.rosterguard.domain.HrProfile;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -45,47 +46,78 @@ public class OutboxRepository {
         this.jdbc = jdbc;
     }
 
-    // ── Write (called inside the deactivation transaction) ────────────────────
+    // ── Writes (called inside mutation transactions) ─────────────────────────
+
+    /** Insert an outbox event for an HR CREATE event. */
+    public void insertCreateEvent(String tenantId, String employeeId, long version, HrProfile profile) {
+        String dedupKey = "HR_CREATE:" + employeeId + ":" + version;
+        String payload = """
+                {"employeeId":"%s","eventType":"EMPLOYEE_CREATED","sourceVersion":%d,"profile":{"name":%s,"email":%s,"officeCode":%s,"shiftCode":%s}}"""
+                .formatted(employeeId, version,
+                        quote(profile == null ? null : profile.name()),
+                        quote(profile == null ? null : profile.email()),
+                        quote(profile == null ? null : profile.officeCode()),
+                        quote(profile == null ? null : profile.shiftCode()));
+        insertRaw(tenantId, employeeId, "EMPLOYEE_CREATED", dedupKey, payload);
+    }
+
+    /** Insert an outbox event for an HR UPDATE event. */
+    public void insertUpdateEvent(String tenantId, String employeeId, long version, HrProfile profile) {
+        String dedupKey = "HR_UPDATE:" + employeeId + ":" + version;
+        String payload = """
+                {"employeeId":"%s","eventType":"EMPLOYEE_UPDATED","sourceVersion":%d,"profile":{"name":%s,"email":%s,"officeCode":%s,"shiftCode":%s}}"""
+                .formatted(employeeId, version,
+                        quote(profile == null ? null : profile.name()),
+                        quote(profile == null ? null : profile.email()),
+                        quote(profile == null ? null : profile.officeCode()),
+                        quote(profile == null ? null : profile.shiftCode()));
+        insertRaw(tenantId, employeeId, "EMPLOYEE_UPDATED", dedupKey, payload);
+    }
+
+    /** Insert an outbox event for a Transport-owned field update. */
+    public void insertTransportUpdateEvent(String tenantId, String employeeId, long transportVersion,
+                                           String pickupPoint, String specialAssistance) {
+        String dedupKey = "TRANSPORT_UPDATE:" + employeeId + ":" + transportVersion;
+        String payload = """
+                {"employeeId":"%s","eventType":"EMPLOYEE_TRANSPORT_UPDATED","transportVersion":%d,"pickupPoint":%s,"specialAssistance":%s}"""
+                .formatted(employeeId, transportVersion, quote(pickupPoint), quote(specialAssistance));
+        insertRaw(tenantId, employeeId, "EMPLOYEE_TRANSPORT_UPDATED", dedupKey, payload);
+    }
 
     /**
      * Insert an outbox event in the same transaction as the employee deactivation.
-     * The unique constraint on (tenant_id, dedup_key) is an ON CONFLICT DO NOTHING guard:
-     * a duplicate deactivation signal does not create a duplicate event row.
-     *
-     * @param tenantId            tenant scope
-     * @param employeeId          aggregate root
-     * @param deactivationVersion source version that triggered this deactivation (part of dedup key)
+     * The unique constraint on (tenant_id, dedup_key) is an ON CONFLICT DO NOTHING guard.
      */
-    public void insertDeactivationEvent(String tenantId, String employeeId,
-                                        long deactivationVersion) {
+    public void insertDeactivationEvent(String tenantId, String employeeId, long deactivationVersion) {
         String dedupKey = "DEACTIVATE:" + employeeId + ":" + deactivationVersion;
         String payload = """
                 {"employeeId":"%s","eventType":"EMPLOYEE_DEACTIVATED","sourceVersion":%d}"""
                 .formatted(employeeId, deactivationVersion);
-        jdbc.update("""
-                INSERT INTO outbox_event
-                    (tenant_id, aggregate_id, event_type, dedup_key, payload)
-                VALUES (?, ?, 'EMPLOYEE_DEACTIVATED', ?, CAST(? AS jsonb))
-                ON CONFLICT (tenant_id, dedup_key) DO NOTHING
-                """, tenantId, employeeId, dedupKey, payload);
+        insertRaw(tenantId, employeeId, "EMPLOYEE_DEACTIVATED", dedupKey, payload);
     }
 
     /**
-     * Insert a deactivation event for a CSV-import-triggered deactivation. The dedup key
-     * includes the import ID so it is distinct from HR-event deactivations of the same employee.
+     * Insert a deactivation event for a CSV-import-triggered deactivation.
      */
-    public void insertCsvDeactivationEvent(String tenantId, String employeeId,
-                                           UUID importId) {
+    public void insertCsvDeactivationEvent(String tenantId, String employeeId, UUID importId) {
         String dedupKey = "CSV_DEACTIVATE:" + employeeId + ":" + importId;
         String payload = """
                 {"employeeId":"%s","eventType":"EMPLOYEE_DEACTIVATED","importId":"%s"}"""
                 .formatted(employeeId, importId);
+        insertRaw(tenantId, employeeId, "EMPLOYEE_DEACTIVATED", dedupKey, payload);
+    }
+
+    private void insertRaw(String tenantId, String employeeId, String eventType, String dedupKey, String payload) {
         jdbc.update("""
                 INSERT INTO outbox_event
                     (tenant_id, aggregate_id, event_type, dedup_key, payload)
-                VALUES (?, ?, 'EMPLOYEE_DEACTIVATED', ?, CAST(? AS jsonb))
+                VALUES (?, ?, ?, ?, CAST(? AS jsonb))
                 ON CONFLICT (tenant_id, dedup_key) DO NOTHING
-                """, tenantId, employeeId, dedupKey, payload);
+                """, tenantId, employeeId, eventType, dedupKey, payload);
+    }
+
+    private static String quote(String val) {
+        return val == null ? "null" : "\"" + val.replace("\"", "\\\"") + "\"";
     }
 
     // ── Relay read path ───────────────────────────────────────────────────────
@@ -94,8 +126,6 @@ public class OutboxRepository {
      * Atomically claim and lease up to {@link #RELAY_BATCH} PENDING events whose next_attempt_at is in the past.
      * {@code FOR UPDATE SKIP LOCKED} prevents concurrent workers from locking the same rows.
      * Within the same query, {@code next_attempt_at} is advanced by {@code leaseSeconds} into the future.
-     * This ensures that when the claim transaction commits and releases row locks, other workers
-     * still cannot claim the same rows during the lease window.
      */
     public List<OutboxEvent> claimPending(int leaseSeconds) {
         return jdbc.query("""
@@ -131,24 +161,19 @@ public class OutboxRepository {
 
     /**
      * Schedule a retry with exponential backoff: delay = 2^attempts seconds, capped at 1 hour.
-     * Increments the attempt counter and records the error reason (class name only — no message
-     * that might contain PII or driver internals).
      */
     public void markForRetry(String tenantId, UUID id, int currentAttempts,
                              String errorClass, int maxAttempts) {
         int nextAttempts = currentAttempts + 1;
         if (nextAttempts >= maxAttempts) {
-            // Dead-letter: stop retrying.
             jdbc.update("""
                     UPDATE outbox_event SET
                         status = 'FAILED', attempts = ?, last_error = ?, published_at = NULL
                     WHERE tenant_id = ? AND id = ?
                     """, nextAttempts, errorClass, tenantId, id);
         } else {
-            // Exponential backoff: 2^attempt seconds, max 3600.
             long delaySec = Math.min((long) Math.pow(2, nextAttempts), 3600L);
-            OffsetDateTime nextAt = OffsetDateTime.now(ZoneOffset.UTC)
-                    .plusSeconds(delaySec);
+            OffsetDateTime nextAt = OffsetDateTime.now(ZoneOffset.UTC).plusSeconds(delaySec);
             jdbc.update("""
                     UPDATE outbox_event SET
                         attempts = ?, next_attempt_at = ?, last_error = ?
@@ -157,18 +182,33 @@ public class OutboxRepository {
         }
     }
 
-    // ── Monitoring read path ──────────────────────────────────────────────────
+    // ── Monitoring read path with stable composite cursor pagination ─────────
 
     /**
      * Keyset-paginated outbox listing for OPERATOR monitoring.
-     * Returns events for the given tenant, ordered by created_at DESC (newest first).
-     * An optional status filter narrows to PENDING / PUBLISHED / FAILED.
+     * Orders by (created_at DESC, id DESC) and uses matching composite cursor keys.
      */
     public List<OutboxEvent> list(String tenantId, String afterId, int limit,
                                   String statusFilter) {
         UUID afterUuid = null;
+        OffsetDateTime afterCreatedAt = null;
+
         if (afterId != null && !afterId.isBlank()) {
-            afterUuid = UUID.fromString(afterId);
+            try {
+                afterUuid = UUID.fromString(afterId.trim());
+                List<OffsetDateTime> timestamps = jdbc.queryForList("""
+                        SELECT created_at FROM outbox_event
+                        WHERE tenant_id = ? AND id = ?
+                        """, OffsetDateTime.class, tenantId, afterUuid);
+                if (!timestamps.isEmpty()) {
+                    afterCreatedAt = timestamps.get(0);
+                } else {
+                    // Cursor references nonexistent row for this tenant; return empty list
+                    return List.of();
+                }
+            } catch (IllegalArgumentException e) {
+                return List.of();
+            }
         }
 
         StringBuilder sql = new StringBuilder("""
@@ -184,8 +224,10 @@ public class OutboxRepository {
             sql.append(" AND status = ?");
             params.add(statusFilter);
         }
-        if (afterUuid != null) {
-            sql.append(" AND id < ?");
+        if (afterCreatedAt != null && afterUuid != null) {
+            sql.append(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+            params.add(afterCreatedAt);
+            params.add(afterCreatedAt);
             params.add(afterUuid);
         }
         sql.append(" ORDER BY created_at DESC, id DESC LIMIT ?");

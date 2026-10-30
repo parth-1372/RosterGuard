@@ -9,7 +9,9 @@ import com.rosterguard.domain.HrEventType;
 import com.rosterguard.domain.HrEventValidator;
 import com.rosterguard.domain.VersionDecision;
 import com.rosterguard.domain.VersionPolicy;
+import com.rosterguard.outbox.OutboxRepository;
 import com.rosterguard.repository.EmployeeRepository;
+import com.rosterguard.repository.EmployeeRepository.UpsertResult;
 import com.rosterguard.repository.EmployeeRepository.VersionInfo;
 import com.rosterguard.repository.OfficeRepository;
 import com.rosterguard.service.EventResult.Outcome;
@@ -33,13 +35,16 @@ public class EmployeeSyncService {
 
     private final EmployeeRepository employees;
     private final OfficeRepository offices;
+    private final OutboxRepository outbox;
     private final TransactionTemplate tx;
     private final ObjectMapper mapper;
 
     public EmployeeSyncService(EmployeeRepository employees, OfficeRepository offices,
+                               OutboxRepository outbox,
                                TransactionTemplate tx, ObjectMapper mapper) {
         this.employees = employees;
         this.offices = offices;
+        this.outbox = outbox;
         this.tx = tx;
         this.mapper = mapper;
     }
@@ -77,13 +82,24 @@ public class EmployeeSyncService {
         long version = event.sourceVersion();
         String payloadHash = CanonicalHasher.payloadHash(event.type(), event.effectiveProfile());
 
-        boolean applied = event.type() == HrEventType.DEACTIVATE
-                ? employees.deactivateWithSideEffects(tenantId, id, version, event.sourceUpdatedAt(), payloadHash)
-                : employees.upsertHr(tenantId, id, version, event.sourceUpdatedAt(),
-                        event.effectiveProfile(),
-                        CanonicalHasher.rosterHash(event.effectiveProfile()), payloadHash);
-        if (applied) {
-            return EventResult.of(id, Outcome.APPLIED);
+        if (event.type() == HrEventType.DEACTIVATE) {
+            boolean applied = employees.deactivateWithSideEffects(
+                    tenantId, id, version, event.sourceUpdatedAt(), payloadHash);
+            if (applied) {
+                return EventResult.of(id, Outcome.APPLIED);
+            }
+        } else {
+            UpsertResult res = employees.upsertHrWithResult(tenantId, id, version, event.sourceUpdatedAt(),
+                    event.effectiveProfile(),
+                    CanonicalHasher.rosterHash(event.effectiveProfile()), payloadHash);
+            if (res.applied()) {
+                if (res.isNew()) {
+                    outbox.insertCreateEvent(tenantId, id, version, event.effectiveProfile());
+                } else {
+                    outbox.insertUpdateEvent(tenantId, id, version, event.effectiveProfile());
+                }
+                return EventResult.of(id, Outcome.APPLIED);
+            }
         }
 
         // Not applied: either the employee does not exist (deactivate) or stored version >= incoming.

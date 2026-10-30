@@ -21,18 +21,21 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <h3>Pipeline</h3>
  * <ol>
  *   <li>Create import record in STAGING state.</li>
- *   <li>Stream CSV: for each row, record seen IDs (even if invalid), stage valid rows, log errors.</li>
+ *   <li>Check tenant snapshot watermark (reject/hold older snapshots).</li>
+ *   <li>Stream CSV: for each row, record seen IDs (even if invalid), stage valid rows, record errors.</li>
  *   <li>Safety gates — evaluated before any destructive write:
  *     <ul>
- *       <li>Any row missing a usable employeeId → NEEDS_REVIEW</li>
- *       <li>Any duplicate employee ID in the file → NEEDS_REVIEW</li>
- *       <li>snapshotGeneratedAt absent → AWAITING_APPROVAL (no deactivations possible)</li>
- *       <li>Missing-employee ratio &ge; threshold → AWAITING_APPROVAL</li>
+ *       <li>Invalid header row → NEEDS_REVIEW (INVALID_HEADER)</li>
+ *       <li>Any row missing a usable employeeId → NEEDS_REVIEW (MISSING_EMPLOYEE_ID)</li>
+ *       <li>Any duplicate employee ID in the file → NEEDS_REVIEW (DUPLICATE_EMPLOYEE_ID)</li>
+ *       <li>snapshotGeneratedAt absent → AWAITING_APPROVAL (NO_SNAPSHOT_WATERMARK, no deactivations)</li>
+ *       <li>Missing-employee ratio &ge; configurable threshold → AWAITING_APPROVAL (MISSING_THRESHOLD_EXCEEDED)</li>
  *     </ul>
  *   </li>
- *   <li>Apply upserts (set-based INSERT … ON CONFLICT).</li>
+ *   <li>Apply upserts and outbox events in a single set-based transaction.</li>
  *   <li>Apply deactivations guarded by source_updated_at &le; snapshotGeneratedAt,
  *       cancelling future bookings, releasing seats, and enqueuing outbox events in the same transaction.</li>
+ *   <li>Update tenant latest snapshot watermark on successful completion.</li>
  *   <li>Finalise the import record.</li>
  * </ol>
  *
@@ -43,18 +46,17 @@ public class RosterImportService {
 
     private static final Logger log = LoggerFactory.getLogger(RosterImportService.class);
 
-    /** Active employees absent from the file above this fraction → require operator approval. */
-    static final double MISSING_THRESHOLD = 0.30;
-
     private final RosterImportRepository imports;
     private final OfficeRepository offices;
     private final TransactionTemplate tx;
+    private final RosterProperties props;
 
     public RosterImportService(RosterImportRepository imports, OfficeRepository offices,
-                               TransactionTemplate tx) {
+                               TransactionTemplate tx, RosterProperties props) {
         this.imports = imports;
         this.offices = offices;
         this.tx = tx;
+        this.props = props;
     }
 
     /**
@@ -91,16 +93,30 @@ public class RosterImportService {
     private UUID processImport(String tenantId, UUID importId, InputStream csvStream,
                                Instant snapshotGeneratedAt) throws IOException {
 
-        Set<String> knownOfficeCodes = offices.codes(tenantId);
         int activeCountAtStart = imports.countActive(tenantId);
 
+        // ── Stale snapshot watermark protection ───────────────────────────────
+        if (snapshotGeneratedAt != null) {
+            Optional<Instant> lastWatermark = imports.getLatestSnapshotWatermark(tenantId);
+            if (lastWatermark.isPresent() && !snapshotGeneratedAt.isAfter(lastWatermark.get())) {
+                log.warn("import needs review (stale snapshot) tenant={} importId={} snapshotAt={} watermark={}",
+                        tenantId, importId, snapshotGeneratedAt, lastWatermark.get());
+                finalise(tenantId, importId, ImportStatus.NEEDS_REVIEW,
+                        activeCountAtStart, 0, 0,
+                        0, 0, 0, HoldReason.STALE_SNAPSHOT);
+                return importId;
+            }
+        }
+
+        Set<String> knownOfficeCodes = offices.codes(tenantId);
+
         // ── 2. Stream and stage ──────────────────────────────────────────────
-        // Accumulators; flushed to DB in batches for memory efficiency.
         List<CsvRow>  validBatch   = new ArrayList<>(RosterImportRepository.BATCH_SIZE);
         List<String>  seenIdBatch  = new ArrayList<>(RosterImportRepository.BATCH_SIZE);
 
         long[] counters = {0, 0, 0}; // [totalRows, rejectedRows, missingIdRows]
         boolean[] hasRowMissingId = {false};
+        boolean[] hasHeaderError = {false};
 
         long totalRows = CsvParser.parse(
                 csvStream,
@@ -122,7 +138,8 @@ public class RosterImportService {
                         // Validate officeCode against the tenant's known offices.
                         if (!knownOfficeCodes.contains(row.profile().officeCode())) {
                             counters[1]++;
-                            // Not staged; the office check is not a "missing-ID" situation.
+                            imports.recordErrors(tenantId, importId, row.rowNumber(), row.employeeId(),
+                                    List.of(new FieldError("officeCode", "UNKNOWN_OFFICE")));
                             return;
                         }
                         validBatch.add(row);
@@ -135,9 +152,10 @@ public class RosterImportService {
                     }
                 },
                 (rowNum, errors) -> {
-                    // Log errors without the raw values.
-                    String empId = null; // errors list may be for a row with a parseable ID
-                    imports.recordErrors(tenantId, importId, rowNum, empId, errors);
+                    if (rowNum == 0) {
+                        hasHeaderError[0] = true;
+                    }
+                    imports.recordErrors(tenantId, importId, rowNum, null, errors);
                 });
 
         // Flush remaining rows.
@@ -147,6 +165,15 @@ public class RosterImportService {
         int rejectedRows = (int) counters[1];
 
         // ── 3. Safety gates ──────────────────────────────────────────────────
+
+        // Gate 0: Header error
+        if (hasHeaderError[0]) {
+            log.warn("import needs review (invalid header) tenant={} importId={}", tenantId, importId);
+            finalise(tenantId, importId, ImportStatus.NEEDS_REVIEW,
+                    activeCountAtStart, (int) totalRows, rejectedRows,
+                    0, 0, 0, HoldReason.INVALID_HEADER);
+            return importId;
+        }
 
         // Gate A: any row without a usable employee ID → data quality issue.
         if (hasRowMissingId[0]) {
@@ -184,7 +211,7 @@ public class RosterImportService {
         int missing = imports.countMissing(tenantId, importId);
         if (activeCountAtStart > 0) {
             double missingRatio = (double) missing / activeCountAtStart;
-            if (missingRatio >= MISSING_THRESHOLD) {
+            if (missingRatio >= props.missingThreshold()) {
                 int newCount = imports.countNew(tenantId, importId);
                 int changed  = imports.countChanged(tenantId, importId);
                 applyUpserts(tenantId, importId); // upserts are safe regardless
@@ -206,6 +233,7 @@ public class RosterImportService {
                 d = imports.applyDeactivations(tenantId, importId, snapshotGeneratedAt);
             }
             applyUpserts(tenantId, importId);
+            imports.updateLatestSnapshotWatermark(tenantId, snapshotGeneratedAt);
             return d;
         });
 
@@ -218,7 +246,10 @@ public class RosterImportService {
         return importId;
     }
 
-    /** Apply the approve decision: run deactivations, then mark COMPLETED in a single transaction. */
+    /**
+     * Apply the approve decision atomically: transition status to COMPLETED first (to prevent
+     * concurrent approval/rejection races), run deactivations, and update watermark in the same transaction.
+     */
     public Optional<ImportRecord> approve(String tenantId, UUID importId, String operatorId) {
         return tx.execute(status -> {
             Optional<ImportRecord> rec = imports.find(tenantId, importId);
@@ -226,27 +257,47 @@ public class RosterImportService {
                 return Optional.empty();
             }
             ImportRecord r = rec.get();
+            boolean approved = imports.approve(tenantId, importId, operatorId);
+            if (!approved) {
+                return Optional.empty();
+            }
             // Re-run deactivations only if we have a watermark (NO_SNAPSHOT_WATERMARK holds skip them).
             if (r.snapshotGeneratedAt() != null
                     && !HoldReason.NO_SNAPSHOT_WATERMARK.name().equals(r.holdReason())) {
                 imports.applyDeactivations(tenantId, importId, r.snapshotGeneratedAt());
             }
-            imports.approve(tenantId, importId, operatorId);
+            imports.updateLatestSnapshotWatermark(tenantId, r.snapshotGeneratedAt());
             return imports.find(tenantId, importId);
         });
     }
 
+    /**
+     * Apply the reject decision atomically: transition status to REJECTED.
+     */
     public Optional<ImportRecord> reject(String tenantId, UUID importId, String operatorId) {
-        Optional<ImportRecord> rec = imports.find(tenantId, importId);
-        if (rec.isEmpty() || rec.get().status() != ImportStatus.AWAITING_APPROVAL) {
-            return Optional.empty();
-        }
-        imports.reject(tenantId, importId, operatorId);
-        return imports.find(tenantId, importId);
+        return tx.execute(status -> {
+            Optional<ImportRecord> rec = imports.find(tenantId, importId);
+            if (rec.isEmpty() || rec.get().status() != ImportStatus.AWAITING_APPROVAL) {
+                return Optional.empty();
+            }
+            boolean rejected = imports.reject(tenantId, importId, operatorId);
+            if (!rejected) {
+                return Optional.empty();
+            }
+            return imports.find(tenantId, importId);
+        });
     }
 
     public Optional<ImportRecord> findImport(String tenantId, UUID importId) {
         return imports.find(tenantId, importId);
+    }
+
+    public Optional<List<ImportErrorRecord>> listErrors(String tenantId, UUID importId, Long after, int limit) {
+        if (imports.find(tenantId, importId).isEmpty()) {
+            return Optional.empty();
+        }
+        int safeLimit = Math.min(Math.max(limit, 1), 200);
+        return Optional.of(imports.listErrors(tenantId, importId, after, safeLimit));
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

@@ -1,6 +1,10 @@
 spring:
   application:
     name: rosterguard
+  servlet:
+    multipart:
+      max-file-size: 32MB
+      max-request-size: 34MB
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/rosterguard?reWriteBatchedInserts=true}
     username: ${DB_USER:rosterguard}
@@ -16,6 +20,9 @@ rosterguard:
   outbox:
     relay-interval-ms: ${OUTBOX_RELAY_INTERVAL_MS:5000}
     max-attempts: ${OUTBOX_MAX_ATTEMPTS:5}
+    lease-seconds: ${OUTBOX_LEASE_SECONDS:60}
+  roster:
+    missing-threshold: ${ROSTER_MISSING_THRESHOLD:0.30}
 
 management:
   endpoints:

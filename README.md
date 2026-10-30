@@ -12,7 +12,7 @@
 flowchart TD
     subgraph Ingestion["Ingestion Layer"]
         HR_API["HR Event Stream<br/>(POST /api/v1/employees/events)"]
-        CSV_IN["Nightly CSV Snapshot<br/>(POST /api/v1/roster/imports)"]
+        CSV_IN["Nightly CSV Snapshot<br/>(POST /api/v1/roster-imports)"]
         TA_API["Transport Admin API<br/>(PUT /api/v1/employees/{id}/transport)"]
     end
 
@@ -23,13 +23,14 @@ flowchart TD
     subgraph Core["Core Processing & Safety Gates"]
         VP["Version Policy & Canonical Hasher<br/>(SHA-256 Length-Prefixed)"]
         STREAM["Streaming CSV Parser<br/>(Batch size: 1,000, O(1) Heap)"]
-        GATES{"Safety Gates<br/>- Duplicate IDs?<br/>- Missing IDs?<br/>- Missing Ratio >= 30%?<br/>- Snapshot Watermark?"}
+        GATES{"Safety Gates<br/>- Invalid/Duplicate Headers?<br/>- Duplicate IDs?<br/>- Missing IDs?<br/>- Missing Ratio >= Threshold?<br/>- Stale Watermark?"}
     end
 
     subgraph DB["PostgreSQL 16 Engine (Tenant-Scoped Keys)"]
         EMP[("employee<br/>(tenant_id, employee_id)")]
         REV[("employee_event_review<br/>(Conflicting Payloads)")]
         STG[("roster_staging & import_seen_id")]
+        ERR[("import_row_error<br/>(PII-Safe Codes)")]
         BOOK[("booking & seat_allocation")]
         OUTBOX[("outbox_event<br/>(Transactional Outbox)")]
     end
@@ -48,14 +49,16 @@ flowchart TD
 
     VP -->|Conditional Atomic Upsert| EMP
     VP -->|Split-Brain Conflict| REV
+    VP -->|Transactional Outbox| OUTBOX
 
+    STREAM --> ERR
     STREAM --> STG
     STG --> GATES
-    GATES -->|Safety Breached| STG
     GATES -->|Reconciliation Safe| EMP
 
     EMP -->|Transactional Deactivation| BOOK
-    EMP -->|Transactional Event Insertion| OUTBOX
+    EMP -->|Transactional Mutations| OUTBOX
+    TA_API -->|Transport Outbox Event| OUTBOX
 
     OUTBOX --> WORKER
     WORKER --> PUBLISHER
@@ -78,18 +81,27 @@ flowchart TD
      WHERE employee.source_version < EXCLUDED.source_version;
      ```
    - Concurrent updates serialize at the row level without explicit table locks or distributed locks.
-2. **Defensive CSV Reconciliation & $O(1)$ Memory (D3):**
+2. **Defensive CSV Reconciliation & $O(1)$ Memory (D3, D15, D16):**
    - CSV processing streams row-by-row into PostgreSQL unlogged staging tables in batches of 1,000. JVM heap utilization remains flat ($O(1)$) regardless of file size.
+   - **Header Validation & Column Reordering:** The CSV header is strictly validated for required columns (`employeeId`, `sourceVersion`, `sourceUpdatedAt`, `name`, `email`, `phone`, `managerId`, `officeCode`, `shiftCode`), duplicates, and unexpected columns. Arbitrary column ordering in valid files is handled cleanly via dynamic column mapping.
+   - **Upload Limits:** Configured with 32MB max file size and 34MB max multipart request size to protect memory and bandwidth.
    - **Seen ID Tracking:** Every parseable employee ID is recorded in `import_seen_id` before field validation. A syntax error in a profile does not mark an employee as missing.
-   - **Destructive Deactivation Safety Gates:** If duplicate employee IDs exist, any row has a missing ID, or absent employees exceed the 30% safety threshold, reconciliation halts in `NEEDS_REVIEW` or `AWAITING_APPROVAL`. Zero deactivations occur without manual human sign-off.
-   - **Source Watermark Protection:** Absent employees are only deactivated if `employee.source_updated_at <= snapshot_generated_at`. An old snapshot cannot deactivate an employee modified after the snapshot was taken.
+   - **Safety Gates & Configurable Threshold:** If duplicate employee IDs exist, any row has a missing ID, or absent employees exceed the configurable safety threshold (`rosterguard.roster.missing-threshold`, default 30%, validated 0.0–1.0), reconciliation halts in `NEEDS_REVIEW` or `AWAITING_APPROVAL`. Zero deactivations occur without manual human sign-off.
+   - **Stale Snapshot Watermark Protection:** A tenant-level watermark (`tenant.latest_snapshot_watermark`) tracks the latest applied snapshot timestamp. Any snapshot with `snapshotGeneratedAt <= latest_snapshot_watermark` is halted as `NEEDS_REVIEW` (`HoldReason.STALE_SNAPSHOT`), preventing an older snapshot from overwriting newer state.
+   - **Atomic Approval / Rejection:** Status transitions from `AWAITING_APPROVAL` to `COMPLETED` or `REJECTED` are executed atomically with conditional row checks (`WHERE status = 'AWAITING_APPROVAL'`), eliminating approval/rejection races.
 3. **Physical Multi-Tenant Isolation (D10):**
    - Every database table begins with `tenant_id` as the primary key prefix.
    - Foreign keys to `employee`, `roster_import`, and `booking` are composite keys including `tenant_id`, enforced physically by the PostgreSQL engine.
    - Tenant context is extracted exclusively from the authenticated JWT `tenant` claim, never from request parameters.
-4. **Transactional Outbox & Side Effect Guarantee (D12):**
-   - Deactivation (via HR event or CSV import), future booking cancellation (`booking.status = 'CANCELLED'`), seat release (`seat_allocation.released_at = now()`), and outbox event insertion (`outbox_event`) execute in a single PostgreSQL transaction.
-   - The outbox relay uses `SELECT ... FOR UPDATE SKIP LOCKED` combined with an atomic CTE lease renewal (`next_attempt_at = now() + interval '60s'`) to prevent concurrent workers from claiming the same event.
+4. **Comprehensive Transactional Outbox for All Applied Mutations (D12, D14):**
+   - Every state change enqueues an outbox event in the same transaction:
+     - `EMPLOYEE_CREATED` on HR API and CSV employee creation
+     - `EMPLOYEE_UPDATED` on HR API and CSV profile updates
+     - `EMPLOYEE_DEACTIVATED` on HR event and CSV deactivation
+     - `EMPLOYEE_TRANSPORT_UPDATED` on Transport Admin edits (updating pickup location or wheelchair assistance)
+   - **Transport Outbox Event Decision:** Downstream vehicle routing, shift rostering, and driver dispatch engines must be notified immediately when an employee's pickup point or special assistance needs change, even though transport edits do not modify the HR source version.
+   - **Set-Based Writable CTEs:** For bulk CSV imports, employee upserts, deactivations, booking cancellations, seat releases, and outbox insertions execute simultaneously in single writable CTE queries directly inside PostgreSQL, maintaining $O(1)$ memory.
+   - **Relay Mechanism:** The outbox relay uses `SELECT ... FOR UPDATE SKIP LOCKED` combined with an atomic CTE lease renewal (`next_attempt_at = now() + interval '60s'`) to prevent concurrent workers from claiming the same event.
    - Guarantees **at least once** delivery. Downstream consumers deduplicate using `id` or `dedup_key`.
 
 ---
@@ -104,11 +116,11 @@ Target: Completion within 60 seconds and capped heap memory $\le 256$ MB.
 ================================================================================
 BENCHMARK 1 RESULTS:
   Total Rows:           200,000 (~18 MB synthetic CSV)
-  Total Time:           22.91 seconds (22,913 ms)
-  Throughput:           8,729 rows/second
+  Total Time:           29.07 seconds (29,074 ms)
+  Throughput:           6,879 rows/second
   Baseline Heap:        31 MB
-  Peak Heap:            31 MB (Cap: 256 MB)
-  Evaluation:           PASS (Time: 22.91s <= 60s | Peak Heap: 31 MB <= 256 MB)
+  Peak Heap:            113 MB (Cap: 256 MB)
+  Evaluation:           PASS (Time: 29.07s <= 60s | Peak Heap: 113 MB <= 256 MB)
 ================================================================================
 ```
 
@@ -126,7 +138,7 @@ Measured over 1,000 real-time events across worker concurrency levels:
 - **Result:** Completed in **10.19 seconds**. 0 deadlocks, strict version monotonicity preserved, exactly 0 duplicate publications.
 
 ### Benchmark 4: Malformed CSV & Resilience Test (`LargeFileResilienceTest`)
-- **20,000 rows with 10% malformed lines:** Processed in 15.05 seconds with 0 MB heap delta ($O(1)$ streaming). All syntax errors captured in `import_row_error` with zero raw PII logged.
+- **20,000 rows with 10% malformed lines:** Processed in 15.05 seconds with 0 MB heap delta ($O(1)$ streaming). All syntax errors and unknown office codes captured in `import_row_error` with zero raw PII logged.
 - **Duplicate ID detection:** 1,000 rows with duplicate employee IDs immediately held in `NEEDS_REVIEW`; 0 destructive updates applied.
 
 ---
@@ -138,13 +150,14 @@ Measured over 1,000 real-time events across worker concurrency levels:
 | **F1: Out-of-Order Events** | Older event (v2) arrives after newer (v3) | Atomic conditional SQL ignores stale update (`409 STALE`). | `EmployeeConcurrencyIT` |
 | **F2: Duplicate Deliveries** | HR system resends same payload | SHA-256 payload hash match returns `200 DUPLICATE` (no-op). | `EmployeeSyncServiceIT` |
 | **F3: Same-Version Conflict** | Identical version with different payload | Routed to `employee_event_review` for operator decision. | `EmployeeSyncServiceIT` |
-| **F4: Truncated CSV File** | 50% of employees missing from CSV | Missing ratio $\ge 30\%$ triggers `AWAITING_APPROVAL` tripwire. | `RosterImportIT` |
+| **F4: Truncated CSV File** | 50% of employees missing from CSV | Missing ratio $\ge$ configured threshold (30%) triggers `AWAITING_APPROVAL`. | `RosterImportSafetyGatesIT` |
 | **F5: Malformed CSV Rows** | Syntax error in profile row | Field error logged without PII; employee ID recorded in seen list. | `LargeFileResilienceTest` |
 | **F6: Duplicate IDs in Snapshot**| Same ID appears twice in CSV | Detector halts reconciliation; status set to `NEEDS_REVIEW`. | `LargeFileResilienceTest` |
-| **F7: Stale CSV Snapshot** | Old snapshot uploaded after events | Source watermark condition `source_updated_at <= snapshot_at` protects newer data. | `RosterImportIT` |
-| **F8: Partial Deactivation Crash**| DB connection drops during seat release | Wrapped in single `@Transactional`; all side-effects roll back atomically. | `DeactivationTransactionRollbackIT` |
+| **F7: Stale CSV Snapshot** | Old snapshot uploaded after newer events | Tenant watermark check and source condition `source_updated_at <= snapshot_at` protects newer data. | `RosterImportSafetyGatesIT` |
+| **F8: Partial Deactivation Crash**| DB error or outbox failure during mutation | Wrapped in single `@Transactional`; all side-effects and employee changes roll back. | `OutboxMutationsIT` |
 | **F9: Worker Crash on Publish** | Relay crashes after sending message | Atomic CTE lease expires after 60s; retried by next worker (**at least once**). | `OutboxRelayIT` |
 | **F10: Repeated Downstream Outage**| Downstream publisher down | Exponential backoff (`base * 2^attempts`); moves to `FAILED` DLQ after 5 attempts. | `OutboxRelayIT` |
+| **F11: Approval / Rejection Race**| Two operators concurrently click approve/reject | Atomic conditional status update allows exactly one winner; duplicate calls return empty. | `RosterImportSafetyGatesIT` |
 
 ---
 
@@ -219,7 +232,7 @@ curl -i -X POST http://localhost:8080/api/v1/employees/events \
 
 ### 4. Update Transport-Managed Fields
 ```bash
-# Transport admin sets pickup point and assistance (does not affect HR version)
+# Transport admin sets pickup point and assistance (produces EMPLOYEE_TRANSPORT_UPDATED outbox event)
 curl -i -X PUT http://localhost:8080/api/v1/employees/E-101/transport \
   -H "Authorization: Bearer $TA_TOKEN" \
   -H "Content-Type: application/json" \
@@ -240,12 +253,16 @@ curl -i -X POST http://localhost:8080/api/v1/roster-imports \
 # Inspect import status and statistics (OPERATOR role)
 curl -s -X GET http://localhost:8080/api/v1/roster-imports/<IMPORT_ID> \
   -H "Authorization: Bearer $OP_TOKEN" | jq .
+
+# Inspect row-level error reports with pagination (OPERATOR role)
+curl -s -X GET "http://localhost:8080/api/v1/roster-imports/<IMPORT_ID>/errors?limit=50" \
+  -H "Authorization: Bearer $OP_TOKEN" | jq .
 ```
 
 ### 6. Monitor Transactional Outbox
 ```bash
-# View pending outbox events (operator only)
-curl -s -X GET "http://localhost:8080/api/v1/ops/outbox?status=PENDING" \
+# View pending outbox events with composite keyset pagination (operator only)
+curl -s -X GET "http://localhost:8080/api/v1/ops/outbox?status=PENDING&limit=20" \
   -H "Authorization: Bearer $OP_TOKEN" | jq .
 ```
 
@@ -254,7 +271,7 @@ curl -s -X GET "http://localhost:8080/api/v1/ops/outbox?status=PENDING" \
 ## 6. Running Tests
 
 ```bash
-# Run all 165 correctness and integration tests (requires Docker for Testcontainers)
+# Run all 189 correctness and integration tests (requires Docker for Testcontainers)
 mvn -B -ntp clean test
 
 # Run individual benchmarks

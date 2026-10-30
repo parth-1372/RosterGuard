@@ -10,7 +10,10 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.regex.Pattern;
 
@@ -18,19 +21,20 @@ import java.util.regex.Pattern;
  * Streams a nightly CSV file row by row, emitting either a valid {@link CsvRow} or a list of
  * field errors. The file is never fully loaded into memory: only one line is held at a time.
  *
- * <h3>Expected column order</h3>
+ * <h3>Expected columns (header row is validated and supports arbitrary column ordering)</h3>
  * <pre>
  * employeeId, sourceVersion, sourceUpdatedAt, name, email, phone, managerId, officeCode, shiftCode
  * </pre>
- * The header row is required and skipped automatically.
  *
  * <h3>Error reporting</h3>
  * Field names and error codes only — never the raw value that caused the error (no PII).
  */
 public final class CsvParser {
 
-    // Expected column count (header row defines the contract).
-    private static final int EXPECTED_COLUMNS = 9;
+    private static final Set<String> REQUIRED_COLUMNS = Set.of(
+            "employeeId", "sourceVersion", "sourceUpdatedAt",
+            "name", "email", "phone", "managerId", "officeCode", "shiftCode"
+    );
 
     // Mirrors the HrEventValidator patterns.
     private static final Pattern ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
@@ -48,9 +52,12 @@ public final class CsvParser {
      * Both callbacks fire for invalid rows that still have a usable employeeId (the ID is captured
      * for {@code import_seen_id} even when the row cannot be staged).
      *
+     * <p>Header row is validated against the required columns contract: missing columns, duplicate
+     * columns, empty column names, or unexpected columns emit row 0 errors and halt parsing.
+     *
      * @param stream the raw CSV bytes; closed by the caller
      * @param onRow  called for every row, valid or invalid (the row object carries validity state)
-     * @param onError called for every invalid row with the list of field errors
+     * @param onError called for every invalid row (including row 0 for header errors) with the list of field errors
      * @return total data rows seen (excluding header)
      */
     public static long parse(InputStream stream,
@@ -63,7 +70,34 @@ public final class CsvParser {
             // Empty file: zero rows
             return 0;
         }
-        // We read the header but do not validate column names (positional mapping is fixed).
+
+        String[] rawHeaders = splitCsv(headerLine);
+        Map<String, Integer> colIndex = new LinkedHashMap<>();
+        List<FieldError> headerErrors = new ArrayList<>();
+
+        for (int i = 0; i < rawHeaders.length; i++) {
+            String colName = trimOrNull(rawHeaders[i]);
+            if (colName == null) {
+                headerErrors.add(new FieldError("header", "EMPTY_HEADER_COLUMN"));
+            } else if (colIndex.containsKey(colName)) {
+                headerErrors.add(new FieldError(colName, "DUPLICATE_HEADER_COLUMN"));
+            } else if (!REQUIRED_COLUMNS.contains(colName)) {
+                headerErrors.add(new FieldError(colName, "UNEXPECTED_COLUMN"));
+            } else {
+                colIndex.put(colName, i);
+            }
+        }
+
+        for (String req : REQUIRED_COLUMNS) {
+            if (!colIndex.containsKey(req)) {
+                headerErrors.add(new FieldError(req, "MISSING_REQUIRED_COLUMN"));
+            }
+        }
+
+        if (!headerErrors.isEmpty()) {
+            onError.accept(0L, headerErrors);
+            return 0;
+        }
 
         long rowNumber = 0;
         String line;
@@ -72,7 +106,7 @@ public final class CsvParser {
             if (line.isBlank()) {
                 continue; // skip blank trailing lines
             }
-            ParsedLine pl = parseLine(rowNumber, line);
+            ParsedLine pl = parseLine(rowNumber, line, colIndex);
             onRow.accept(pl.row());
             if (!pl.errors().isEmpty()) {
                 onError.accept(rowNumber, pl.errors());
@@ -86,12 +120,11 @@ public final class CsvParser {
     private record ParsedLine(CsvRow row, List<FieldError> errors) {}
 
     /**
-     * Parse one CSV line. Uses a simple split that handles quoted fields with commas
-     * via a minimal state machine (no external library).
+     * Parse one CSV line using column indices resolved from the header.
      */
-    private static ParsedLine parseLine(long rowNumber, String line) {
+    private static ParsedLine parseLine(long rowNumber, String line, Map<String, Integer> colIndex) {
         String[] cols = splitCsv(line);
-        if (cols.length != EXPECTED_COLUMNS) {
+        if (cols.length != colIndex.size()) {
             return new ParsedLine(
                     CsvRow.invalid(rowNumber, null),
                     List.of(new FieldError("row", "WRONG_COLUMN_COUNT")));
@@ -99,8 +132,8 @@ public final class CsvParser {
 
         List<FieldError> errors = new ArrayList<>();
 
-        // Column 0: employeeId
-        String employeeId = trimOrNull(cols[0]);
+        // employeeId
+        String employeeId = trimOrNull(cols[colIndex.get("employeeId")]);
         if (employeeId == null) {
             errors.add(new FieldError("employeeId", "REQUIRED"));
         } else if (!ID_PATTERN.matcher(employeeId).matches()) {
@@ -108,9 +141,9 @@ public final class CsvParser {
             employeeId = null; // not usable
         }
 
-        // Column 1: sourceVersion
+        // sourceVersion
         Long sourceVersion = null;
-        String rawVersion = trimOrNull(cols[1]);
+        String rawVersion = trimOrNull(cols[colIndex.get("sourceVersion")]);
         if (rawVersion == null) {
             errors.add(new FieldError("sourceVersion", "REQUIRED"));
         } else {
@@ -125,9 +158,9 @@ public final class CsvParser {
             }
         }
 
-        // Column 2: sourceUpdatedAt (ISO-8601)
+        // sourceUpdatedAt (ISO-8601)
         Instant sourceUpdatedAt = null;
-        String rawUpdatedAt = trimOrNull(cols[2]);
+        String rawUpdatedAt = trimOrNull(cols[colIndex.get("sourceUpdatedAt")]);
         if (rawUpdatedAt == null) {
             errors.add(new FieldError("sourceUpdatedAt", "REQUIRED"));
         } else {
@@ -138,13 +171,13 @@ public final class CsvParser {
             }
         }
 
-        // Columns 3-8: HR profile fields
-        String name     = trimOrNull(cols[3]);
-        String email    = trimOrNull(cols[4]);
-        String phone    = trimOrNull(cols[5]);
-        String managerId  = trimOrNull(cols[6]);
-        String officeCode = trimOrNull(cols[7]);
-        String shiftCode  = trimOrNull(cols[8]);
+        // HR profile fields
+        String name       = trimOrNull(cols[colIndex.get("name")]);
+        String email      = trimOrNull(cols[colIndex.get("email")]);
+        String phone      = trimOrNull(cols[colIndex.get("phone")]);
+        String managerId  = trimOrNull(cols[colIndex.get("managerId")]);
+        String officeCode = trimOrNull(cols[colIndex.get("officeCode")]);
+        String shiftCode  = trimOrNull(cols[colIndex.get("shiftCode")]);
 
         if (name == null)       errors.add(new FieldError("name",     "REQUIRED"));
         if (name != null && name.length() > 200) {
@@ -219,4 +252,3 @@ public final class CsvParser {
         return t.isEmpty() ? null : t;
     }
 }
-

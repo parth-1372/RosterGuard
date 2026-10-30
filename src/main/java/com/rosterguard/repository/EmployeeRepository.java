@@ -29,6 +29,10 @@ public class EmployeeRepository {
     public record VersionInfo(long sourceVersion, String payloadHash) {
     }
 
+    public record UpsertResult(boolean applied, boolean isNew) {
+        public static final UpsertResult NOT_APPLIED = new UpsertResult(false, false);
+    }
+
     private static final RowMapper<EmployeeRecord> MAPPER = EmployeeRepository::map;
 
     private final JdbcTemplate jdbc;
@@ -51,7 +55,12 @@ public class EmployeeRepository {
      */
     public boolean upsertHr(String tenantId, String employeeId, long version, Instant sourceUpdatedAt,
                             HrProfile p, String rosterHash, String payloadHash) {
-        return jdbc.update("""
+        return upsertHrWithResult(tenantId, employeeId, version, sourceUpdatedAt, p, rosterHash, payloadHash).applied();
+    }
+
+    public UpsertResult upsertHrWithResult(String tenantId, String employeeId, long version, Instant sourceUpdatedAt,
+                                          HrProfile p, String rosterHash, String payloadHash) {
+        List<Boolean> list = jdbc.query("""
                 INSERT INTO employee (tenant_id, employee_id, name, email, phone, manager_id,
                     office_code, shift_code, status, source_version, source_updated_at,
                     roster_hash, payload_hash)
@@ -65,10 +74,16 @@ public class EmployeeRepository {
                     roster_hash = EXCLUDED.roster_hash, payload_hash = EXCLUDED.payload_hash,
                     applied_at = now()
                 WHERE employee.source_version < EXCLUDED.source_version
+                RETURNING (xmax = 0) AS is_new
                 """,
+                (rs, i) -> rs.getBoolean("is_new"),
                 tenantId, employeeId, p.name(), p.email(), p.phone(), p.managerId(),
                 p.officeCode(), p.shiftCode(), version, toDb(sourceUpdatedAt),
-                rosterHash, payloadHash) > 0;
+                rosterHash, payloadHash);
+        if (list.isEmpty()) {
+            return UpsertResult.NOT_APPLIED;
+        }
+        return new UpsertResult(true, list.get(0));
     }
 
     /** Mark inactive only if the incoming version is strictly newer. HR profile fields are kept. */
@@ -126,12 +141,20 @@ public class EmployeeRepository {
     /** Transport-owned fields only. transport_version is incremented atomically by the server. */
     public boolean updateTransport(String tenantId, String employeeId,
                                    String pickupPoint, String specialAssistance) {
-        return jdbc.update("""
+        return updateTransportWithVersion(tenantId, employeeId, pickupPoint, specialAssistance).isPresent();
+    }
+
+    public java.util.OptionalLong updateTransportWithVersion(String tenantId, String employeeId,
+                                                           String pickupPoint, String specialAssistance) {
+        List<Long> versions = jdbc.query("""
                 UPDATE employee SET pickup_point = ?, special_assistance = ?,
                     transport_version = transport_version + 1
                 WHERE tenant_id = ? AND employee_id = ?
+                RETURNING transport_version
                 """,
-                pickupPoint, specialAssistance, tenantId, employeeId) > 0;
+                (rs, i) -> rs.getLong("transport_version"),
+                pickupPoint, specialAssistance, tenantId, employeeId);
+        return versions.isEmpty() ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(versions.get(0));
     }
 
     public Optional<EmployeeRecord> find(String tenantId, String employeeId) {

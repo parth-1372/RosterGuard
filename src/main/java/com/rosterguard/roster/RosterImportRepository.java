@@ -134,8 +134,8 @@ public class RosterImportRepository {
                 INSERT INTO roster_staging
                     (tenant_id, import_id, employee_id, name, email, phone,
                      manager_id, office_code, shift_code,
-                     source_version, source_updated_at, roster_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_version, source_updated_at, roster_hash, payload_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (tenant_id, import_id, employee_id) DO NOTHING
                 """,
                 batch,
@@ -153,6 +153,7 @@ public class RosterImportRepository {
                     ps.setLong(10, r.sourceVersion());
                     ps.setObject(11, toDb(r.sourceUpdatedAt()));
                     ps.setString(12, r.rosterHash());
+                    ps.setString(13, r.payloadHash());
                 });
     }
 
@@ -198,6 +199,39 @@ public class RosterImportRepository {
         }
     }
 
+    /** Keyset-paginated retrieval of row errors for operator error reports. */
+    public List<ImportErrorRecord> listErrors(String tenantId, UUID importId, Long after, int limit) {
+        if (after == null) {
+            return jdbc.query("""
+                    SELECT id, row_number, employee_id, field, code
+                    FROM import_row_error
+                    WHERE tenant_id = ? AND import_id = ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """, (rs, i) -> new ImportErrorRecord(
+                            rs.getLong("id"),
+                            rs.getLong("row_number"),
+                            rs.getString("employee_id"),
+                            rs.getString("field"),
+                            rs.getString("code")
+                    ), tenantId, importId, limit);
+        } else {
+            return jdbc.query("""
+                    SELECT id, row_number, employee_id, field, code
+                    FROM import_row_error
+                    WHERE tenant_id = ? AND import_id = ? AND id > ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """, (rs, i) -> new ImportErrorRecord(
+                            rs.getLong("id"),
+                            rs.getLong("row_number"),
+                            rs.getString("employee_id"),
+                            rs.getString("field"),
+                            rs.getString("code")
+                    ), tenantId, importId, after, limit);
+        }
+    }
+
     // ── Diff queries (set-based) ──────────────────────────────────────────────
 
     /** Count active employees in this tenant (the denominator for the safety threshold). */
@@ -222,8 +256,7 @@ public class RosterImportRepository {
 
     /**
      * Count how many active employees are absent from the staged snapshot.
-     * An employee is "missing" if they are ACTIVE in employee table and their ID is not in
-     * import_seen_id for this import (not just roster_staging — seen_id covers even invalid rows).
+     * Uses employee_id NOT IN (...) which PostgreSQL optimizes with a fast Hash Anti-Join.
      */
     public int countMissing(String tenantId, UUID importId) {
         Integer n = jdbc.queryForObject("""
@@ -240,7 +273,8 @@ public class RosterImportRepository {
     }
 
     /**
-     * Count staged rows whose roster_hash differs from the current employee row — these are CHANGED.
+     * Count staged rows whose roster_hash differs from the current employee row AND whose source_version
+     * is strictly newer than stored — these are CHANGED.
      */
     public int countChanged(String tenantId, UUID importId) {
         Integer n = jdbc.queryForObject("""
@@ -248,6 +282,7 @@ public class RosterImportRepository {
                 JOIN employee e ON e.tenant_id = rs.tenant_id AND e.employee_id = rs.employee_id
                 WHERE rs.tenant_id = ? AND rs.import_id = ?
                   AND rs.roster_hash <> e.roster_hash
+                  AND rs.source_version > e.source_version
                 """, Integer.class, tenantId, importId);
         return n == null ? 0 : n;
     }
@@ -271,33 +306,64 @@ public class RosterImportRepository {
      * Apply the staged snapshot: upsert CHANGED and NEW employees in a single set-based
      * INSERT ... ON CONFLICT, guarded by the source-version condition.
      *
-     * <p>Only rows whose staged sourceVersion is strictly greater than the stored sourceVersion
-     * are written. This mirrors the API-event path's atomicity guarantee.
+     * <p>Simultaneously inserts EMPLOYEE_CREATED and EMPLOYEE_UPDATED outbox events for all applied
+     * rows in the same transaction using a writable Common Table Expression (CTE).
+     *
+     * @return number of employee rows inserted or updated
      */
     public int applyUpserts(String tenantId, UUID importId) {
-        return jdbc.update("""
-                INSERT INTO employee
-                    (tenant_id, employee_id, name, email, phone, manager_id,
-                     office_code, shift_code, status, source_version, source_updated_at,
-                     roster_hash, payload_hash)
-                SELECT rs.tenant_id, rs.employee_id, rs.name, rs.email, rs.phone, rs.manager_id,
-                       rs.office_code, rs.shift_code, 'ACTIVE',
-                       rs.source_version, rs.source_updated_at, rs.roster_hash,
-                       -- payload_hash for a CSV row: same algorithm, type = CREATE
-                       rs.roster_hash  -- reuse roster_hash as payload_hash for CSV-originated rows
-                FROM roster_staging rs
-                WHERE rs.tenant_id = ? AND rs.import_id = ?
-                ON CONFLICT (tenant_id, employee_id) DO UPDATE SET
-                    name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone,
-                    manager_id = EXCLUDED.manager_id, office_code = EXCLUDED.office_code,
-                    shift_code = EXCLUDED.shift_code, status = 'ACTIVE',
-                    source_version = EXCLUDED.source_version,
-                    source_updated_at = EXCLUDED.source_updated_at,
-                    roster_hash = EXCLUDED.roster_hash,
-                    payload_hash = EXCLUDED.payload_hash,
-                    applied_at = now()
-                WHERE employee.source_version < EXCLUDED.source_version
-                """, tenantId, importId);
+        Integer count = jdbc.queryForObject("""
+                WITH upserted AS (
+                    INSERT INTO employee
+                        (tenant_id, employee_id, name, email, phone, manager_id,
+                         office_code, shift_code, status, source_version, source_updated_at,
+                         roster_hash, payload_hash)
+                    SELECT rs.tenant_id, rs.employee_id, rs.name, rs.email, rs.phone, rs.manager_id,
+                           rs.office_code, rs.shift_code, 'ACTIVE',
+                           rs.source_version, rs.source_updated_at, rs.roster_hash,
+                           rs.payload_hash
+                    FROM roster_staging rs
+                    WHERE rs.tenant_id = ? AND rs.import_id = ?
+                    ON CONFLICT (tenant_id, employee_id) DO UPDATE SET
+                        name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone,
+                        manager_id = EXCLUDED.manager_id, office_code = EXCLUDED.office_code,
+                        shift_code = EXCLUDED.shift_code, status = 'ACTIVE',
+                        source_version = EXCLUDED.source_version,
+                        source_updated_at = EXCLUDED.source_updated_at,
+                        roster_hash = EXCLUDED.roster_hash,
+                        payload_hash = EXCLUDED.payload_hash,
+                        applied_at = now()
+                    WHERE employee.source_version < EXCLUDED.source_version
+                    RETURNING employee.tenant_id, employee.employee_id, employee.source_version,
+                              employee.name, employee.email, employee.phone, employee.manager_id,
+                              employee.office_code, employee.shift_code,
+                              (xmax = 0) AS is_new
+                ),
+                outbox_ins AS (
+                    INSERT INTO outbox_event (tenant_id, aggregate_id, event_type, dedup_key, payload)
+                    SELECT u.tenant_id, u.employee_id,
+                           CASE WHEN u.is_new THEN 'EMPLOYEE_CREATED' ELSE 'EMPLOYEE_UPDATED' END,
+                           CASE WHEN u.is_new THEN 'CSV_CREATE:' || u.employee_id || ':' || u.source_version
+                                ELSE 'CSV_UPDATE:' || u.employee_id || ':' || u.source_version END,
+                           json_build_object(
+                               'employeeId', u.employee_id,
+                               'eventType', CASE WHEN u.is_new THEN 'EMPLOYEE_CREATED' ELSE 'EMPLOYEE_UPDATED' END,
+                               'sourceVersion', u.source_version,
+                               'profile', json_build_object(
+                                   'name', u.name,
+                                   'email', u.email,
+                                   'phone', u.phone,
+                                   'managerId', u.manager_id,
+                                   'officeCode', u.office_code,
+                                   'shiftCode', u.shift_code
+                               )
+                           )::jsonb
+                    FROM upserted u
+                    ON CONFLICT (tenant_id, dedup_key) DO NOTHING
+                )
+                SELECT count(*) FROM upserted
+                """, Integer.class, tenantId, importId);
+        return count == null ? 0 : count;
     }
 
     /**
@@ -305,41 +371,83 @@ public class RosterImportRepository {
      * {@code source_updated_at} is known and earlier than or equal to {@code snapshotGeneratedAt}
      * (old-file protection: D1b).
      *
-     * <p>Employees whose {@code source_updated_at} is NULL are intentionally skipped: without a
-     * source watermark we cannot determine whether the snapshot is authoritative for that employee,
-     * so deactivation is unsafe.
-     *
-     * <p>An employee whose HR record is newer than the snapshot is also NOT deactivated — we
-     * cannot trust that the snapshot is authoritative for them.
-     *
-     * <p>For each deactivated employee, future bookings are cancelled, seats released, and an
-     * outbox event is inserted in the caller's transaction.
+     * <p>Executes deactivation, future booking cancellation, seat release, and outbox event insertion
+     * atomically in a single set-based SQL query via writable CTEs.
      *
      * @return number of employees deactivated
      */
     public int applyDeactivations(String tenantId, UUID importId, Instant snapshotGeneratedAt) {
-        List<String> deactivatedIds = jdbc.queryForList("""
-                UPDATE employee e SET
-                    status = 'INACTIVE',
-                    applied_at = now()
-                WHERE e.tenant_id = ?
-                  AND e.status = 'ACTIVE'
-                  AND e.employee_id NOT IN (
-                      SELECT s.employee_id FROM import_seen_id s
-                      WHERE s.tenant_id = ?
-                        AND s.import_id = ?
-                  )
-                  AND e.source_updated_at IS NOT NULL
-                  AND e.source_updated_at <= ?
-                RETURNING e.employee_id
-                """, String.class, tenantId, tenantId, importId, toDb(snapshotGeneratedAt));
+        Integer count = jdbc.queryForObject("""
+                WITH deactivated AS (
+                    UPDATE employee e SET
+                        status = 'INACTIVE',
+                        applied_at = now()
+                    WHERE e.tenant_id = ?
+                      AND e.status = 'ACTIVE'
+                      AND e.employee_id NOT IN (
+                          SELECT s.employee_id FROM import_seen_id s
+                          WHERE s.tenant_id = ?
+                            AND s.import_id = ?
+                      )
+                      AND e.source_updated_at IS NOT NULL
+                      AND e.source_updated_at <= ?
+                    RETURNING e.tenant_id, e.employee_id
+                ),
+                cancelled_bookings AS (
+                    UPDATE booking b SET
+                        status = 'CANCELLED',
+                        cancelled_at = now()
+                    FROM deactivated d
+                    WHERE b.tenant_id = d.tenant_id
+                      AND b.employee_id = d.employee_id
+                      AND b.status = 'CONFIRMED'
+                      AND b.start_time > now()
+                    RETURNING b.tenant_id, b.id AS booking_id
+                ),
+                released_seats AS (
+                    UPDATE seat_allocation sa SET
+                        released_at = now()
+                    FROM cancelled_bookings cb
+                    WHERE sa.tenant_id = cb.tenant_id
+                      AND sa.booking_id = cb.booking_id
+                      AND sa.released_at IS NULL
+                    RETURNING sa.tenant_id, sa.booking_id
+                ),
+                outbox_ins AS (
+                    INSERT INTO outbox_event (tenant_id, aggregate_id, event_type, dedup_key, payload)
+                    SELECT d.tenant_id, d.employee_id, 'EMPLOYEE_DEACTIVATED',
+                           'CSV_DEACTIVATE:' || d.employee_id || ':' || CAST(? AS text),
+                           json_build_object(
+                               'employeeId', d.employee_id,
+                               'eventType', 'EMPLOYEE_DEACTIVATED',
+                               'importId', CAST(? AS text)
+                           )::jsonb
+                    FROM deactivated d
+                    ON CONFLICT (tenant_id, dedup_key) DO NOTHING
+                )
+                SELECT count(*) FROM deactivated
+                """, Integer.class, tenantId, tenantId, importId, toDb(snapshotGeneratedAt),
+                importId.toString(), importId.toString());
+        return count == null ? 0 : count;
+    }
 
-        for (String empId : deactivatedIds) {
-            List<UUID> cancelledBookings = deactivations.cancelFutureBookings(tenantId, empId);
-            deactivations.releaseSeats(tenantId, cancelledBookings);
-            outbox.insertCsvDeactivationEvent(tenantId, empId, importId);
-        }
-        return deactivatedIds.size();
+    // ── Tenant Snapshot Watermark ─────────────────────────────────────────────
+
+    public Optional<Instant> getLatestSnapshotWatermark(String tenantId) {
+        List<OffsetDateTime> list = jdbc.query(
+                "SELECT latest_snapshot_watermark FROM tenant WHERE id = ?",
+                (rs, i) -> rs.getObject(1, OffsetDateTime.class),
+                tenantId);
+        return list.isEmpty() || list.get(0) == null ? Optional.empty() : Optional.of(list.get(0).toInstant());
+    }
+
+    public void updateLatestSnapshotWatermark(String tenantId, Instant watermark) {
+        if (watermark == null) return;
+        jdbc.update("""
+                UPDATE tenant
+                SET latest_snapshot_watermark = GREATEST(COALESCE(latest_snapshot_watermark, ?), ?)
+                WHERE id = ?
+                """, toDb(watermark), toDb(watermark), tenantId);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Unit tests for CsvParser. No Spring context needed.
- * Verifies that streaming, error reporting, and ID capture behave correctly.
+ * Verifies that streaming, error reporting, header validation, and ID capture behave correctly.
  */
 class CsvParserTest {
 
@@ -232,5 +232,58 @@ class CsvParserTest {
         // Ensure no error code contains "NOT_AN_EMAIL" (the raw value).
         assertThat(errors).noneMatch(e -> e.code().contains("NOT_AN_EMAIL"));
         assertThat(errors).noneMatch(e -> e.field().contains("NOT_AN_EMAIL"));
+    }
+
+    // ── 8. Header validation & Reordering ────────────────────────────────────
+
+    @Test
+    void reorderedColumns_parsedCorrectly() throws IOException {
+        String reorderedHeader = "name,employeeId,sourceVersion,sourceUpdatedAt,email,phone,managerId,officeCode,shiftCode";
+        String row = "Bob Smith,E-REORDER-1,3,2024-01-15T08:00:00Z,bob@example.com,+919000000001,M1,BLR,DAY";
+
+        ParseResult r = parse(reorderedHeader + "\n" + row);
+        assertThat(r.rows()).hasSize(1);
+        CsvRow parsed = r.rows().get(0);
+        assertThat(parsed.isValid()).isTrue();
+        assertThat(parsed.employeeId()).isEqualTo("E-REORDER-1");
+        assertThat(parsed.sourceVersion()).isEqualTo(3L);
+        assertThat(parsed.profile().name()).isEqualTo("Bob Smith");
+        assertThat(parsed.profile().email()).isEqualTo("bob@example.com");
+        assertThat(parsed.profile().officeCode()).isEqualTo("BLR");
+        assertThat(r.errorRowNums()).isEmpty();
+    }
+
+    @Test
+    void missingRequiredHeaderColumn_failsAtRowZero() throws IOException {
+        // Missing shiftCode
+        String badHeader = "employeeId,sourceVersion,sourceUpdatedAt,name,email,phone,managerId,officeCode";
+        ParseResult r = parse(badHeader + "\n" + VALID_ROW);
+
+        assertThat(r.rows()).isEmpty();
+        assertThat(r.errorRowNums()).containsExactly(0L);
+        assertThat(r.errorLists().get(0))
+                .anyMatch(e -> e.field().equals("shiftCode") && e.code().equals("MISSING_REQUIRED_COLUMN"));
+    }
+
+    @Test
+    void duplicateHeaderColumn_failsAtRowZero() throws IOException {
+        String badHeader = "employeeId,sourceVersion,sourceUpdatedAt,name,email,phone,managerId,officeCode,employeeId";
+        ParseResult r = parse(badHeader + "\n" + VALID_ROW);
+
+        assertThat(r.rows()).isEmpty();
+        assertThat(r.errorRowNums()).containsExactly(0L);
+        assertThat(r.errorLists().get(0))
+                .anyMatch(e -> e.field().equals("employeeId") && e.code().equals("DUPLICATE_HEADER_COLUMN"));
+    }
+
+    @Test
+    void unexpectedHeaderColumn_failsAtRowZero() throws IOException {
+        String badHeader = "employeeId,sourceVersion,sourceUpdatedAt,name,email,phone,managerId,officeCode,shiftCode,extraCol";
+        ParseResult r = parse(badHeader + "\n" + VALID_ROW);
+
+        assertThat(r.rows()).isEmpty();
+        assertThat(r.errorRowNums()).containsExactly(0L);
+        assertThat(r.errorLists().get(0))
+                .anyMatch(e -> e.field().equals("extraCol") && e.code().equals("UNEXPECTED_COLUMN"));
     }
 }

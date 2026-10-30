@@ -59,6 +59,9 @@ class EmployeeConcurrencyIT extends PostgresIntegrationTest {
     @Test
     void shuffledVersionsRacingOnANewEmployeeAlwaysEndAtTheHighestVersion() throws Exception {
         for (int round = 0; round < 5; round++) {
+            jdbc.update("DELETE FROM outbox_event WHERE tenant_id = ?", T1);
+            jdbc.update("DELETE FROM employee_event_review WHERE tenant_id = ?", T1);
+            jdbc.update("DELETE FROM booking WHERE tenant_id = ?", T1);
             jdbc.update("DELETE FROM employee WHERE tenant_id = ?", T1);
             List<Integer> order = new ArrayList<>();
             for (int v = 1; v <= 40; v++) {
