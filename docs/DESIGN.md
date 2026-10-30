@@ -33,7 +33,7 @@ flowchart TD
         
         DOMAIN["Domain Engine<br/>VersionPolicy (Strict Monotonicity)<br/>CanonicalHasher (Length-Prefixed SHA-256)<br/>HrEventValidator (Regex & Office Checks)"]
         
-        GATES["Defensive Safety Tripwires<br/>Header Contract | Duplicate IDs<br/>Missing IDs | Watermark Check<br/>Missing Threshold (>= 30%)"]
+        GATES["Defensive Safety Tripwires<br/>Header Contract &bull; Duplicate IDs<br/>Missing IDs &bull; Watermark Check<br/>Missing Threshold (>= 30%)"]
     end
 
     subgraph DataStore["PostgreSQL 16 Storage Engine (Physical Tenant Scoping)"]
@@ -60,7 +60,7 @@ flowchart TD
 
     HR_STREAM -->|POST /api/v1/employees/events| TRACE
     HR_BATCH -->|POST /api/v1/roster-imports| TRACE
-    ADMIN -->|PUT /api/v1/employees/{id}/transport| TRACE
+    ADMIN -->|PUT /api/v1/employees/:id/transport| TRACE
     OPERATOR -->|GET, POST /approve, /reject| TRACE
 
     TRACE --> JWT_AUTH
@@ -325,7 +325,7 @@ sequenceDiagram
             Ctrl-->>HR: 200 OK (Upserts Committed, Deactivations Held)
             
             Note over Ops, Svc: Operator Investigates Discrepancy
-            Ops->>Ctrl: POST /api/v1/roster-imports/{id}/approve
+            Ops->>Ctrl: POST /api/v1/roster-imports/:importId/approve
             Ctrl->>Svc: approve(tenantId, importId, operatorId)
             Svc->>DB: Begin Atomic Approval Transaction
             Svc->>Repo: approve(tenantId, importId, operatorId)
