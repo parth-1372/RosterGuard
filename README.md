@@ -28,7 +28,7 @@ curl -s http://localhost:8080/actuator/health
 
 The service starts PostgreSQL on port `5432` and RosterGuard on `8080` under the `dev` profile with pre-seeded demo tenants (`tenant-1`, `tenant-2`).
 
-For complete end-to-end evaluation (token minting, HR event ingestion, CSV import, and outbox relay verification), follow the step-by-step **[Evaluator Demo Runbook](docs/DEMO_RUNBOOK.md)** or use the pre-configured **[Postman Collection](postman/RosterGuard.postman_collection.json)**.
+For complete end-to-end evaluation (token minting, HR event ingestion, CSV import, and outbox relay verification), watch the **[Walkthrough Demo Video (GitHub Release)](https://github.com/parth-1372/RosterGuard/releases/tag/v1.0.0)**, follow the step-by-step **[Evaluator Demo Runbook](docs/DEMO_RUNBOOK.md)**, or use the pre-configured **[Postman Collection](postman/RosterGuard.postman_collection.json)**.
 
 ---
 
@@ -103,6 +103,7 @@ RosterGuard anticipates operational failure modes across network partitions, mal
 
 ## 8. Documentation & Evaluation Assets
 
+- 🎥 **Walkthrough Demo Video:** [GitHub Release v1.0.0 (MP4 Download)](https://github.com/parth-1372/RosterGuard/releases/tag/v1.0.0)
 - 📖 **System Design & Architecture:** [docs/DESIGN.md](docs/DESIGN.md)
 - 📋 **Complete API Reference:** [docs/API_REFERENCE.md](docs/API_REFERENCE.md)
 - 🛡️ **Failure Modes & Mitigation Matrix:** [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md)

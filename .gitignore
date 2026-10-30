@@ -21,3 +21,6 @@ bench-data/
 demo/
 docs/INTERVIEW_NOTES.md
 docs/DESIGN_DECISIONS.md
+
+# Media assets (hosted on GitHub Releases)
+*.mp4
