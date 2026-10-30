@@ -152,78 +152,54 @@ sequenceDiagram
     participant Sync as EmployeeSyncService
     participant Validator as HrEventValidator
     participant Repo as EmployeeRepository
-    participant Deact as DeactivationRepository
-    participant Outbox as OutboxRepository
     participant DB as PostgreSQL 16
+    participant Outbox as OutboxRepository
 
     HR->>Filter: POST /api/v1/employees/events (Bearer Token + JSON Batch)
-    Filter->>Filter: Validate HS256 signature, expiry, claims (tenant, roles)
-    Filter->>Ctrl: Dispatch with Authenticated Caller
-    Ctrl->>Ctrl: Validate batch size <= 1000; parse EventDto to HrEvent
+    Filter->>Filter: Validate HS256 token and extract tenant and roles
+    Filter->>Ctrl: Dispatch authenticated request
+    Ctrl->>Ctrl: Validate batch envelope (up to 1,000 items)
     
-    loop For Each Valid Event in Batch
+    loop For Each Event in Batch (Isolated Transaction)
         Ctrl->>Sync: process(tenantId, hrEvent)
         Sync->>Validator: validate(hrEvent, knownOffices)
-        alt Validation Errors Found
-            Validator-->>Sync: List<FieldError>
+        alt Validation Failure
+            Validator-->>Sync: Return FieldErrors
             Sync-->>Ctrl: EventResult.rejected(errors)
         else Validation Passed
             Sync->>DB: Begin Independent Transaction
-            alt Event Type is CREATE or UPDATE
-                Sync->>Repo: upsertHrWithResult(tenantId, event, hashes)
-                Repo->>DB: INSERT INTO employee ... ON CONFLICT DO UPDATE WHERE source_version < EXCLUDED.source_version
-                alt Version Condition Succeeded (Row Written)
-                    DB-->>Repo: applied = true, is_new flag
-                    Repo-->>Sync: UpsertResult(applied, isNew)
-                    alt isNew is True
-                        Sync->>Outbox: insertCreateEvent(tenantId, employeeId, version, profile)
-                    else isNew is False
-                        Sync->>Outbox: insertUpdateEvent(tenantId, employeeId, version, profile)
-                    end
-                    Outbox->>DB: INSERT INTO outbox_event (dedup_key) ON CONFLICT DO NOTHING
+            alt CREATE or UPDATE Event
+                Sync->>Repo: upsertHrWithResult(tenantId, event)
+                Repo->>DB: Conditional INSERT ... ON CONFLICT DO UPDATE
+                alt Stored Version Is Older (Row Applied)
+                    DB-->>Repo: Row inserted or updated
+                    Repo->>Outbox: insertEvent(tenantId, employeeId, version)
+                    Outbox->>DB: INSERT INTO outbox_event (dedup_key)
                     Sync->>DB: Commit Transaction
                     Sync-->>Ctrl: EventResult(APPLIED)
-                else Version Condition Failed (Stored Version >= Incoming)
-                    DB-->>Repo: Empty ResultSet (applied = false)
-                    Repo-->>Sync: UpsertResult(NOT_APPLIED)
-                    Sync->>Repo: findVersionInfo(tenantId, employeeId)
-                    Repo->>DB: SELECT source_version, payload_hash FROM employee
-                    DB-->>Repo: Stored version & payload_hash
-                    Repo-->>Sync: VersionInfo
-                    Sync->>Sync: VersionPolicy.decide(storedVersion, storedHash, inVersion, inHash)
-                    alt Decision == DUPLICATE
-                        Sync->>DB: Commit (No-op)
-                        Sync-->>Ctrl: EventResult(DUPLICATE)
-                    else Decision == STALE
-                        Sync->>DB: Commit (No-op)
-                        Sync-->>Ctrl: EventResult(STALE)
-                    else Decision == CONFLICT
-                        Sync->>Repo: saveConflictForReview(tenantId, conflictPayload)
-                        Repo->>DB: INSERT INTO employee_event_review ... ON CONFLICT DO NOTHING
-                        Sync->>DB: Commit Transaction
+                else Stored Version Is Newer or Same
+                    DB-->>Repo: Zero rows updated (Conflict guard)
+                    Sync->>Sync: VersionPolicy: STALE, DUPLICATE, or CONFLICT
+                    alt Same Version but Different Payload (Split-Brain)
+                        Sync->>DB: INSERT INTO employee_event_review
+                        Sync->>DB: Commit
                         Sync-->>Ctrl: EventResult(CONFLICT_HELD)
+                    else Stale or Duplicate Upstream Retry
+                        Sync->>DB: Commit (No-op)
+                        Sync-->>Ctrl: EventResult(STALE or DUPLICATE)
                     end
                 end
-            else Event Type is DEACTIVATE
-                Sync->>Repo: deactivateWithSideEffects(tenantId, employeeId, version, timestamp)
-                Repo->>DB: UPDATE employee SET status = 'INACTIVE' WHERE source_version < incoming
-                alt Version Guard Passed
-                    Repo->>Deact: cancelFutureBookings(tenantId, employeeId)
-                    Deact->>DB: UPDATE booking SET status = 'CANCELLED' WHERE start_time > now() RETURNING id
-                    Deact->>Deact: releaseSeats(tenantId, bookingIds)
-                    Deact->>DB: UPDATE seat_allocation SET released_at = now()
-                    Repo->>Outbox: insertDeactivationEvent(tenantId, employeeId, version)
-                    Outbox->>DB: INSERT INTO outbox_event (dedup_key) ON CONFLICT DO NOTHING
-                    Sync->>DB: Commit Transaction
-                    Sync-->>Ctrl: EventResult(APPLIED)
-                else Version Guard Failed or Employee Absent
-                    Sync->>DB: Rollback / Re-classify
-                    Sync-->>Ctrl: EventResult(STALE or UNKNOWN_EMPLOYEE)
-                end
+            else DEACTIVATE Event
+                Sync->>Repo: deactivateWithSideEffects(tenantId, employeeId, version)
+                Repo->>DB: UPDATE employee SET status='INACTIVE'
+                Repo->>DB: Cancel future bookings and release seats
+                Repo->>Outbox: insertDeactivationEvent(tenantId, employeeId, version)
+                Sync->>DB: Commit Transaction
+                Sync-->>Ctrl: EventResult(APPLIED)
             end
         end
     end
-    Ctrl-->>HR: BatchResponse(List<EventResult>)
+    Ctrl-->>HR: BatchResponse(List of EventResults)
 ```
 
 ---
@@ -287,73 +263,52 @@ Before any destructive change or profile overwrite is committed, the staged impo
 ```mermaid
 sequenceDiagram
     autonumber
-    actor HR as Upstream HR / Scheduled Job
+    actor HR as Upstream HRMS
     actor Ops as Operations Supervisor
     participant Ctrl as RosterImportController
     participant Svc as RosterImportService
     participant Parser as CsvParser
-    participant Repo as RosterImportRepository
     participant DB as PostgreSQL 16
 
+    Note over HR, DB: Phase 1: Bounded-Memory Streaming Ingestion
     HR->>Ctrl: POST /api/v1/roster-imports (Multipart CSV + snapshotGeneratedAt)
     Ctrl->>Svc: importCsv(tenantId, stream, snapshotGeneratedAt)
-    Svc->>Repo: create(tenantId, snapshotGeneratedAt)
-    Repo->>DB: INSERT INTO roster_import (status='STAGING') RETURNING id
+    Svc->>DB: Check watermark and create import session (STAGING)
     
-    alt Snapshot Stale (snapshotGeneratedAt <= tenant.watermark)
-        Svc->>Repo: finalise(NEEDS_REVIEW, STALE_SNAPSHOT)
-        Svc-->>Ctrl: importId (Status: NEEDS_REVIEW)
-        Ctrl-->>HR: 200 OK (Import Staged & Held)
-    else Snapshot Watermark Valid
-        loop Streaming 1,000-Row Chunks
-            Parser->>Parser: Read line, parse fields, extract employeeId
-            Parser->>Repo: stageBatch(roster_staging) & recordSeenIds(import_seen_id)
-            Repo->>DB: Batch INSERT INTO roster_staging & import_seen_id
-        end
+    loop Stream line-by-line in 1,000-row chunks
+        Parser->>Parser: Validate line syntax and extract employeeId
+        Parser->>DB: Flush batch to roster_staging and import_seen_id
+    end
 
-        Svc->>Svc: Evaluate Safety Tripwires (Gates 0, A, B, C, D)
-
-        alt Tripped Data Quality Gates (0, A, or B)
-            Svc->>Repo: finalise(NEEDS_REVIEW, HoldReason)
-            Svc-->>Ctrl: importId (Status: NEEDS_REVIEW)
-            Ctrl-->>HR: 200 OK (Held for Operator Review)
-        else Tripped Threshold or Missing Watermark (Gates C or D)
-            Svc->>Repo: applyUpserts(tenantId, importId)
-            Repo->>DB: Writable CTE (Upsert New/Changed + Outbox Events)
-            Svc->>Repo: finalise(AWAITING_APPROVAL, HoldReason)
-            Svc-->>Ctrl: importId (Status: AWAITING_APPROVAL)
-            Ctrl-->>HR: 200 OK (Upserts Committed, Deactivations Held)
-            
-            Note over Ops, Svc: Operator Investigates Discrepancy
-            Ops->>Ctrl: POST /api/v1/roster-imports/:importId/approve
-            Ctrl->>Svc: approve(tenantId, importId, operatorId)
-            Svc->>DB: Begin Atomic Approval Transaction
-            Svc->>Repo: approve(tenantId, importId, operatorId)
-            Repo->>DB: UPDATE roster_import SET status='COMPLETED' WHERE status='AWAITING_APPROVAL'
-            alt Conditional CAS Update Succeeded (count == 1)
-                Svc->>Repo: applyDeactivations(tenantId, importId, snapshotGeneratedAt)
-                Repo->>DB: Writable CTE (Deactivate + Cancel Bookings + Release Seats + Outbox)
-                Svc->>Repo: updateLatestSnapshotWatermark(tenantId, snapshotGeneratedAt)
-                Svc->>DB: Commit Approval Transaction
-                Svc-->>Ctrl: Updated ImportRecord
-                Ctrl-->>Ops: 200 OK (Reconciliation Finalized)
-            else Concurrent Race (Another Operator Already Approved/Rejected)
-                Svc->>DB: Rollback
-                Svc-->>Ctrl: Optional.empty()
-                Ctrl-->>Ops: 404 / 409 Conflict
-            end
-        else All Safety Gates Passed
-            Svc->>DB: Begin Reconciliation Transaction
-            Svc->>Repo: applyDeactivations(tenantId, importId, snapshotGeneratedAt)
-            Repo->>DB: Writable CTE (Deactivate + Cancel Bookings + Release Seats + Outbox)
-            Svc->>Repo: applyUpserts(tenantId, importId)
-            Repo->>DB: Writable CTE (Upsert New/Changed + Outbox)
-            Svc->>Repo: updateLatestSnapshotWatermark(tenantId, snapshotGeneratedAt)
-            Svc->>DB: Commit Transaction
-            Svc->>Repo: finalise(COMPLETED)
-            Svc-->>Ctrl: importId (Status: COMPLETED)
-            Ctrl-->>HR: 200 OK (Fully Reconciled)
-        end
+    Note over Svc, DB: Phase 2: Defensive Safety Gates Evaluation
+    Svc->>DB: Query seen IDs, duplicates, missing ratio, watermark
+    
+    alt Safety Gates Fail (Corrupt Header, Duplicate IDs, or Missing IDs)
+        Svc->>DB: Mark import as NEEDS_REVIEW (Zero state changes)
+        Svc-->>Ctrl: Return importId (Status: NEEDS_REVIEW)
+        Ctrl-->>HR: 200 OK (Import Held for Data Quality Review)
+    else Anomaly Detected (Missing Ratio >= 30% or Missing Watermark)
+        Svc->>DB: Apply upserts safely and suspend all deactivations
+        Svc->>DB: Mark import as AWAITING_APPROVAL
+        Svc-->>Ctrl: Return importId (Status: AWAITING_APPROVAL)
+        Ctrl-->>HR: 200 OK (Upserts Applied, Deactivations Held)
+        
+        Note over Ops, DB: Phase 3: Operator Audit & Sign-off
+        Ops->>Ctrl: POST /api/v1/roster-imports/:id/approve
+        Ctrl->>Svc: approve(tenantId, importId, operatorId)
+        Svc->>DB: Atomic CAS update status='COMPLETED' WHERE status='AWAITING_APPROVAL'
+        Svc->>DB: Execute deactivations and cancel bookings (Writable CTE)
+        Svc->>DB: Update tenant snapshot watermark
+        Ctrl-->>Ops: 200 OK (Reconciliation Finalized)
+    else All Safety Gates Cleanly Passed
+        Note over Svc, DB: Automated Full Reconciliation
+        Svc->>DB: Begin Single Atomic Transaction
+        Svc->>DB: Writable CTE: Deactivate absent employees & cancel bookings
+        Svc->>DB: Writable CTE: Upsert new/changed employees & write outbox
+        Svc->>DB: Update tenant snapshot watermark
+        Svc->>DB: Commit Transaction and mark COMPLETED
+        Svc-->>Ctrl: Return importId (Status: COMPLETED)
+        Ctrl-->>HR: 200 OK (Fully Reconciled)
     end
 ```
 
@@ -399,47 +354,39 @@ sequenceDiagram
     actor App as Business Service (HR / CSV / Transport)
     participant DB as PostgreSQL (outbox_event)
     participant Relay as OutboxRelay (Scheduled Worker)
-    participant Repo as OutboxRepository
     participant Pub as EventPublisher (Logging Adapter)
     actor Broker as Downstream Broker / Consumers
 
     Note over App, DB: Phase 1: Transactional Insertion
     App->>DB: Begin Business Transaction
-    App->>DB: Apply Entity Mutations (employee / booking / seat)
-    App->>Repo: insertOutboxEvent(tenantId, aggregateId, eventType, dedupKey, payload)
-    Repo->>DB: INSERT INTO outbox_event (status='PENDING', next_attempt_at=now())<br/>ON CONFLICT (tenant_id, dedup_key) DO NOTHING
+    App->>DB: Apply Entity Mutations (employee, booking, seat)
+    App->>DB: INSERT INTO outbox_event (status='PENDING', next_attempt_at=now())
     App->>DB: Commit Business Transaction (Atomic Local ACID)
 
     Note over Relay, DB: Phase 2: Claim & Atomic Lease Renewal
-    loop Every relay-interval-ms (default: 5000ms)
-        Relay->>Repo: claimPending(leaseSeconds = 60)
-        Repo->>DB: Atomic CTE: SELECT ... FOR UPDATE SKIP LOCKED LIMIT 10<br/>UPDATE outbox_event SET next_attempt_at = now() + 60s RETURNING *
-        DB-->>Repo: List<OutboxEvent> (Leased to this worker)
-        Repo-->>Relay: Claimed Batch
+    loop Scheduled Relay Poll Loop (every 5000ms)
+        Relay->>DB: Atomic CTE: SELECT ... FOR UPDATE SKIP LOCKED LIMIT 10
+        Relay->>DB: UPDATE outbox_event SET next_attempt_at = now() + 60s
+        DB-->>Relay: Return claimed batch (60s lease active)
         
         loop For Each Claimed Event
             Note over Relay, Pub: Phase 3: External Publication
             alt Happy Path Delivery
                 Relay->>Pub: publish(event)
-                Pub->>Broker: Dispatch JSON Event (Structured Log / Network Push)
-                Broker-->>Pub: Acknowledged
-                Relay->>Repo: markPublished(tenantId, event.id)
-                Repo->>DB: UPDATE outbox_event SET status='PUBLISHED', published_at=now()
-            else Transient Failure (Network Lag / Broker Timeout)
+                Pub->>Broker: Dispatch JSON Event Payload
+                Relay->>DB: UPDATE outbox_event SET status='PUBLISHED', published_at=now()
+            else Transient Error (Broker Timeout / Network Lag)
                 Relay->>Pub: publish(event)
                 Pub-->>Relay: Throws RuntimeException
-                Relay->>Repo: markForRetry(attempts, delay = 2^attempts)
-                Repo->>DB: UPDATE outbox_event SET attempts = attempts + 1,<br/>next_attempt_at = now() + 2^attempts seconds, last_error = ...
-            else Terminal Poison Pill (attempts >= maxAttempts = 5)
+                Relay->>DB: UPDATE outbox_event SET attempts = attempts + 1, next_attempt_at = now() + 2^attempts
+            else Poison Pill (attempts reach maxAttempts 5)
                 Relay->>Pub: publish(event)
                 Pub-->>Relay: Throws RuntimeException
-                Relay->>Repo: markForRetry (exceeds maxAttempts)
-                Repo->>DB: UPDATE outbox_event SET status='FAILED', last_error = ...
-                Note over DB: Quarantined in Dead Letter Queue (DLQ)
-            else Worker Process Hard Crash Mid-Flight
+                Relay->>DB: UPDATE outbox_event SET status='FAILED' (Dead Letter Queue)
+            else Worker Process Crash Mid-Flight
                 Relay->>Pub: publish(event)
-                Note over Relay: JVM Process Dies Before markPublished()
-                Note over DB: Event remains status='PENDING'.<br/>60-second lease countdown elapses in database.<br/>Next surviving worker re-claims and re-publishes.<br/>Downstream consumers deduplicate by id or dedup_key.
+                Note over Relay: JVM dies before status update
+                Note over DB: 60-second lease expires in PostgreSQL.<br/>Surviving worker reclaims and republishes (At-least-once).
             end
         end
     end
