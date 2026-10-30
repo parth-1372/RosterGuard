@@ -1,0 +1,7 @@
+employeeId,sourceVersion,sourceUpdatedAt,name,email,phone,managerId,officeCode,shiftCode
+E-101,1,2024-01-15T08:00:00Z,Alice Johnson,alice@company.com,+919876543210,M-01,BLR,GENERAL
+E-102,1,2024-01-15T08:00:00Z,Bob Smith,bob@company.com,+919876543211,M-01,PUN,NIGHT
+E-103,1,2024-01-15T08:00:00Z,Carol Danvers,carol@company.com,+919876543212,M-02,HYD,MORNING
+E-104,1,2024-01-15T08:00:00Z,David Miller,david@company.com,+919876543213,M-02,BLR,GENERAL
+E-105,1,2024-01-15T08:00:00Z,Eva Green,eva@company.com,+919876543214,M-01,PUN,EVENING
+

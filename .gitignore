@@ -17,5 +17,7 @@ target/
 bench-data/
 *.csv.gen
 
-docs/
+# Local prep & candidate material (not for publication)
 demo/
+docs/INTERVIEW_NOTES.md
+docs/DESIGN_DECISIONS.md

@@ -1,0 +1,678 @@
+{
+  "info": {
+    "name": "RosterGuard API Collection",
+    "description": "Comprehensive API collection for RosterGuard: HR event stream ingestion, nightly CSV reconciliation, transport edits, transactional outbox monitoring, and safety gates.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "01. Authentication & Token Minting",
+      "item": [
+        {
+          "name": "Mint HR Integration Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.token) {",
+                  "    pm.environment.set(\"hrToken\", jsonData.token);",
+                  "    pm.collectionVariables.set(\"hrToken\", jsonData.token);",
+                  "    pm.test(\"Token acquired and saved to hrToken\", function () { pm.expect(jsonData.token).to.be.a('string'); });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"hr-bot\",\n  \"tenant\": \"{{tenant}}\",\n  \"roles\": [\"HR_INTEGRATION\"]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/dev/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "dev",
+                "token"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Mint Transport Admin Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.token) {",
+                  "    pm.environment.set(\"taToken\", jsonData.token);",
+                  "    pm.collectionVariables.set(\"taToken\", jsonData.token);",
+                  "    pm.test(\"Token acquired and saved to taToken\", function () { pm.expect(jsonData.token).to.be.a('string'); });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"transport-lead\",\n  \"tenant\": \"{{tenant}}\",\n  \"roles\": [\"TRANSPORT_ADMIN\"]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/dev/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "dev",
+                "token"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Mint Operator Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.token) {",
+                  "    pm.environment.set(\"opToken\", jsonData.token);",
+                  "    pm.collectionVariables.set(\"opToken\", jsonData.token);",
+                  "    pm.test(\"Token acquired and saved to opToken\", function () { pm.expect(jsonData.token).to.be.a('string'); });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"ops-admin\",\n  \"tenant\": \"{{tenant}}\",\n  \"roles\": [\"OPERATOR\"]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/dev/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "dev",
+                "token"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Mint Employee Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.token) {",
+                  "    pm.environment.set(\"empToken\", jsonData.token);",
+                  "    pm.collectionVariables.set(\"empToken\", jsonData.token);",
+                  "    pm.test(\"Token acquired and saved to empToken\", function () { pm.expect(jsonData.token).to.be.a('string'); });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"emp-alice\",\n  \"tenant\": \"{{tenant}}\",\n  \"roles\": [\"EMPLOYEE\"],\n  \"employeeId\": \"E-101\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/dev/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "dev",
+                "token"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "02. Real-Time HR Ingestion",
+      "item": [
+        {
+          "name": "Ingest Employee Events (CREATE & UPDATE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"events\": [\n    {\n      \"type\": \"CREATE\",\n      \"employeeId\": \"E-101\",\n      \"sourceVersion\": 1,\n      \"sourceUpdatedAt\": \"2024-01-15T09:00:00Z\",\n      \"name\": \"Alice Johnson\",\n      \"email\": \"alice@company.com\",\n      \"phone\": \"+919876543210\",\n      \"managerId\": \"M-01\",\n      \"officeCode\": \"BLR\",\n      \"shiftCode\": \"GENERAL\"\n    },\n    {\n      \"type\": \"CREATE\",\n      \"employeeId\": \"E-102\",\n      \"sourceVersion\": 1,\n      \"sourceUpdatedAt\": \"2024-01-15T09:00:00Z\",\n      \"name\": \"Bob Smith\",\n      \"email\": \"bob@company.com\",\n      \"phone\": \"+919876543211\",\n      \"managerId\": \"M-01\",\n      \"officeCode\": \"PUN\",\n      \"shiftCode\": \"NIGHT\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/employees/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "employees",
+                "events"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Ingest Stale Update (Should Return STALE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"events\": [\n    {\n      \"type\": \"UPDATE\",\n      \"employeeId\": \"E-101\",\n      \"sourceVersion\": 0,\n      \"sourceUpdatedAt\": \"2024-01-15T08:00:00Z\",\n      \"name\": \"Alice Johnson Stale\",\n      \"email\": \"alice@company.com\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"BLR\",\n      \"shiftCode\": \"GENERAL\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/employees/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "employees",
+                "events"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Deactivate Employee",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"events\": [\n    {\n      \"type\": \"DEACTIVATE\",\n      \"employeeId\": \"E-102\",\n      \"sourceVersion\": 2,\n      \"sourceUpdatedAt\": \"2024-01-15T11:00:00Z\"\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/employees/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "employees",
+                "events"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "03. Transport Management",
+      "item": [
+        {
+          "name": "Update Transport Fields",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{taToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pickupPoint\": \"Koramangala 4th Block Water Tank\",\n  \"specialAssistance\": \"Wheelchair ramp required\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/employees/{{employeeId}}/transport",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "employees",
+                "{{employeeId}}",
+                "transport"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Employee Profile",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/employees/{{employeeId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "employees",
+                "{{employeeId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Employees (Paged)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{taToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/employees?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "employees"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "04. Roster CSV Ingestion & Reconciliation",
+      "item": [
+        {
+          "name": "Upload Happy-Path CSV Snapshot",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var jsonData = pm.response.json();",
+                  "if (jsonData.id) {",
+                  "    pm.environment.set(\"importId\", jsonData.id);",
+                  "    pm.collectionVariables.set(\"importId\", jsonData.id);",
+                  "    pm.test(\"Import created and saved to importId\", function () { pm.expect(jsonData.id).to.be.a('string'); });",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "demo/fixtures/happy_path_roster.csv"
+                },
+                {
+                  "key": "snapshotGeneratedAt",
+                  "value": "2024-01-15T12:00:00Z",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/roster-imports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "roster-imports"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Import Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/roster-imports/{{importId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "roster-imports",
+                "{{importId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Import Row Errors",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/roster-imports/{{importId}}/errors?limit=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "roster-imports",
+                "{{importId}}",
+                "errors"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Upload Duplicate ID CSV (Trips Safety Gate)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "demo/fixtures/duplicate_id_roster.csv"
+                },
+                {
+                  "key": "snapshotGeneratedAt",
+                  "value": "2024-01-15T13:00:00Z",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/roster-imports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "roster-imports"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Approve Held Import",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/roster-imports/{{importId}}/approve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "roster-imports",
+                "{{importId}}",
+                "approve"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reject Held Import",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/roster-imports/{{importId}}/reject",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "roster-imports",
+                "{{importId}}",
+                "reject"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "05. Outbox Operations",
+      "item": [
+        {
+          "name": "List Outbox Events",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ops/outbox?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ops",
+                "outbox"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "06. System Health",
+      "item": [
+        {
+          "name": "Health Check (Actuator)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "type": "string"
+    },
+    {
+      "key": "tenant",
+      "value": "tenant-1",
+      "type": "string"
+    },
+    {
+      "key": "hrToken",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "taToken",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "opToken",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "empToken",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "importId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "employeeId",
+      "value": "E-101",
+      "type": "string"
+    }
+  ]
+}

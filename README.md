@@ -6,6 +6,15 @@
 
 ---
 
+## Documentation & Evaluation Assets
+
+- 📖 **[System Design & Architecture](docs/DESIGN.md):** Architectural flows, state machine, and data models.
+- 📋 **[Complete API Reference](docs/API_REFERENCE.md):** Detailed endpoint specifications, request/response DTOs, and JWT role requirements.
+- 🛡️ **[Failure Modes & Self-Healing Matrix](docs/FAILURE_MODES.md):** 14 operational scenarios, detection mechanisms, and automated test proofs.
+- 🚀 **[Evaluator Demo Runbook](docs/DEMO_RUNBOOK.md):** Step-by-step copy-paste guide to exercise all features end-to-end.
+- 📮 **[Postman Collection](postman/RosterGuard.postman_collection.json):** Pre-configured, self-contained Postman collection with automatic token chaining.
+- 📁 **Sample Fixtures:** [Happy Path Roster](samples/happy_path_roster.csv) • [Duplicate ID Roster](samples/duplicate_id_roster.csv)
+
 ## 1. System Architecture
 
 ```mermaid
@@ -272,7 +281,7 @@ curl -i -X PUT http://localhost:8080/api/v1/employees/E-101/transport \
 # Upload a roster CSV snapshot (HR_INTEGRATION role)
 curl -i -X POST http://localhost:8080/api/v1/roster-imports \
   -H "Authorization: Bearer $HR_TOKEN" \
-  -F "file=@sample_roster.csv" \
+  -F "file=@samples/happy_path_roster.csv" \
   -F "snapshotGeneratedAt=2024-01-15T12:00:00Z"
 
 # Inspect import status and statistics (OPERATOR role)
